@@ -1,0 +1,9 @@
+{
+    "name": "com.bananaparty.unislop",
+    "version": "1.0.0",
+    "displayName": "UniSlop",
+    "unity": "6000.3",
+    "description": "Minimalistic portative MCP server for unity, designed for coding.",
+    "license": "MIT",
+    "author": "github.com/forcepusher"
+}

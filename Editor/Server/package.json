@@ -1,0 +1,10 @@
+{
+    "name": "unislop-server",
+    "version": "1.0.0",
+    "type": "module",
+    "dependencies": {
+        "@modelcontextprotocol/server": "latest",
+        "zod": "latest",
+        "@cfworker/json-schema": "latest"
+    }
+}
