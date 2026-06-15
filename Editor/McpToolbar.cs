@@ -18,9 +18,30 @@ namespace UniSlop.MCP
             McpServer.StatusChanged += OnStatusChanged;
         }
 
+        static bool _refreshPending;
+
         static void OnStatusChanged()
         {
+            // The toolbar can't be refreshed mid-compile/import; defer so the label doesn't get
+            // stuck showing a stale status (e.g. "Off") after a reload sets it to Connected.
+            if (EditorApplication.isCompiling || EditorApplication.isUpdating)
+            {
+                if (!_refreshPending)
+                {
+                    _refreshPending = true;
+                    EditorApplication.update += DeferredRefresh;
+                }
+                return;
+            }
+
+            try { MainToolbar.Refresh(ToolbarPath); } catch { }
+        }
+
+        static void DeferredRefresh()
+        {
             if (EditorApplication.isCompiling || EditorApplication.isUpdating) return;
+            EditorApplication.update -= DeferredRefresh;
+            _refreshPending = false;
             try { MainToolbar.Refresh(ToolbarPath); } catch { }
         }
 
@@ -40,15 +61,15 @@ namespace UniSlop.MCP
                 });
 
             yield return new MainToolbarButton(
-                new MainToolbarContent("Copy MCP URL", null, "Copy the MCP server URL to the clipboard"),
-                CopyServerUrl);
+                new MainToolbarContent("Copy MCP Address", null, "Copy the MCP server URL to the clipboard"),
+                CopyMcpAddress);
         }
 
-        static void CopyServerUrl()
+        static void CopyMcpAddress()
         {
             string url = McpServer.GetServerUrl();
             EditorGUIUtility.systemCopyBuffer = url;
-            Debug.Log($"[UniSlop] Copied MCP server URL: {url}");
+            Debug.Log($"[UniSlop] Copied MCP address: {url}");
         }
 
         static string GetStatusText()

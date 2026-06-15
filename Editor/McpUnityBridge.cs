@@ -1,6 +1,4 @@
-using UnityEngine;
 using UnityEditor;
-using UnityEditor.Compilation;
 using UnityEditor.TestTools.TestRunner.Api;
 using System;
 using System.Collections.Generic;
@@ -15,184 +13,243 @@ namespace UniSlop.MCP
     {
         public string command;
         public bool wait = true;
-        public string mode = "editmode";
+        public string mode = "all";
         public string filter;
     }
 
+    // Internal API behind the detached Bun MCP server. Each command is short and non-blocking:
+    // compile and tests are kicked off as jobs (McpCompileJob / McpTestJob) and the Bun server
+    // polls *_status across domain reloads. Nothing here blocks waiting for a reload.
     public static class McpUnityBridge
     {
-        const int DefaultTimeoutMs = 120_000;
-        const int TestTimeoutMs = 300_000;
+        const int DefaultTimeoutMs = 30_000;
+        const int ListTestsTimeoutMs = 60_000;
 
         public static string Handle(McpRequest request)
         {
+            // Status polls are answered straight from a thread-safe cache, WITHOUT marshaling to
+            // the Unity main thread. While the editor is unfocused (user working in Zed) it may
+            // not tick, and a domain reload tears the main loop down — so a main-thread-bound poll
+            // would hang. The cache always has the latest state the editor wrote before reload.
             switch (request.command)
             {
-                case "agent_connected":
-                    return RunOnMainThread(() => Success("Agent connected"));
-                case "compile":
-                    return request.wait ? CompileAndWait() : RunOnMainThread(CompileFireAndForget);
-                case "run_tests":
-                    return RunTests(request.mode, request.filter);
-                default:
-                    return Error($"Unknown command: {request.command}");
+                case "compile_status":
+                    return CompileStatus();
+                case "run_tests_status":
+                    return TestStatus();
+            }
+
+            McpMainThread.BeginRequest();
+            try
+            {
+                switch (request.command)
+                {
+                    case "agent_connected":
+                        return RunOnMainThread(() => Success("Agent connected"));
+                    case "compile_start":
+                        return RunOnMainThread(() =>
+                        {
+                            McpCompileJob.Start();
+                            return Success("Compilation started", "{\"state\":\"running\"}");
+                        });
+                    case "run_tests_start":
+                        return RunOnMainThread(() => StartTestRun(request.mode, request.filter));
+                    case "list_tests":
+                        if (McpTestRunState.IsRunActive)
+                            return Error("Cannot list tests while a Unity test run is in progress");
+                        return ListTests();
+                    default:
+                        return Error($"Unknown command: {request.command}");
+                }
+            }
+            finally
+            {
+                McpMainThread.EndRequest();
             }
         }
 
         static string RunOnMainThread(Func<string> action, int timeoutMs = DefaultTimeoutMs)
         {
-            string result = null;
-            Exception error = null;
-            var done = new ManualResetEventSlim(false);
+            return McpMainThread.Invoke(action, timeoutMs);
+        }
 
-            EditorApplication.delayCall += () =>
+        static string CompileStatus()
+        {
+            string state = McpCompileJob.State;
+            string data = McpCompileJob.BuildStatusData();
+
+            if (state == McpCompileJob.StateDone)
             {
-                try { result = action(); }
-                catch (Exception e) { error = e; }
-                finally { done.Set(); }
-            };
+                int count = McpCompileJob.ErrorCount;
+                string message = count == 0
+                    ? "Compilation finished with no errors"
+                    : $"Compilation finished with {count} error(s)";
+                return Success(message, data);
+            }
 
-            if (!done.Wait(timeoutMs))
-                return Error($"Unity main thread timed out after {timeoutMs / 1000}s");
+            if (state == McpCompileJob.StateRunning)
+                return Success("Compilation in progress", data);
 
-            if (error != null)
-                return Error(error.Message);
-
-            return result;
+            return Success("No compilation has been requested", data);
         }
 
-        static void RunOnMainThread(Action action, int timeoutMs = DefaultTimeoutMs)
+        static string StartTestRun(string mode, string filter)
         {
-            RunOnMainThread(() => { action(); return null; }, timeoutMs);
+            if (McpTestJob.State == McpTestJob.StateRunning || McpTestRunState.IsRunActive)
+                return Success("A test run is already in progress", "{\"state\":\"running\"}");
+
+            if (!McpTestJob.RequestStart(mode, filter, out string error))
+                return Error(error);
+
+            return Success("Test run started", "{\"state\":\"running\"}");
         }
 
-        static string CompileFireAndForget()
+        static string TestStatus()
         {
-            CompilationPipeline.RequestScriptCompilation();
-            return Success("Compilation requested");
+            string state = McpTestJob.State;
+            string data = McpTestJob.BuildStatusData();
+
+            if (state == McpTestJob.StateDone)
+                return Success(McpTestJob.Message, data);
+
+            if (state == McpTestJob.StateRunning)
+                return Success("Test run in progress", data);
+
+            return Success("No test run has been requested", data);
         }
 
-        static string CompileAndWait()
+        static string ListTests()
         {
-            var errors = new List<CompilerMessage>();
-            Action<string, CompilerMessage[]> onFinished = (path, messages) =>
+            string editModeJson = RetrieveTestModeJson(TestMode.EditMode, out string editError);
+            if (editError != null)
+                return editError;
+
+            string playModeJson = RetrieveTestModeJson(TestMode.PlayMode, out string playError);
+            if (playError != null)
+                return playError;
+
+            int editCount = CountTestsInModeJson(editModeJson);
+            int playCount = CountTestsInModeJson(playModeJson);
+            int total = editCount + playCount;
+
+            string data = "{\"editmode\":" + editModeJson
+                + ",\"playmode\":" + playModeJson
+                + ",\"player\":{\"count\":0,\"tests\":[],\"note\":"
+                + JsonStr("Player tests run in a standalone build and cannot be listed from the editor Test Runner API.")
+                + "}}";
+
+            return Success($"Listed {total} test(s) ({editCount} edit, {playCount} play)", data);
+        }
+
+        static string RetrieveTestModeJson(TestMode mode, out string error)
+        {
+            error = null;
+            var holder = new TestListHolder();
+            string modeLabel = ModeLabel(mode);
+
+            McpMainThread.Post(() =>
             {
-                if (messages == null) return;
-                foreach (var msg in messages)
+                try
                 {
-                    if (msg.type == CompilerMessageType.Error)
-                        errors.Add(msg);
+                    McpTestRunState.Api.RetrieveTestList(mode, root =>
+                    {
+                        holder.Payload = BuildModeTestListJson(mode, root);
+                        holder.Done.Set();
+                    });
                 }
-            };
-
-            RunOnMainThread(() =>
-            {
-                CompilationPipeline.assemblyCompilationFinished += onFinished;
-                if (!EditorApplication.isCompiling)
-                    CompilationPipeline.RequestScriptCompilation();
-            });
-
-            try
-            {
-                WaitUntil(() => !QueryIsCompiling(), DefaultTimeoutMs);
-            }
-            catch (TimeoutException e)
-            {
-                return Error(e.Message);
-            }
-            finally
-            {
-                RunOnMainThread(() => CompilationPipeline.assemblyCompilationFinished -= onFinished);
-            }
-
-            if (errors.Count == 0)
-                return Success("Compilation finished with no errors", "{\"errorCount\":0}");
-
-            return Error(
-                $"Compilation finished with {errors.Count} error(s)",
-                BuildCompileErrorsJson(errors));
-        }
-
-        static string RunTests(string mode, string filter)
-        {
-            var testMode = mode?.ToLowerInvariant() == "playmode"
-                ? TestMode.PlayMode
-                : TestMode.EditMode;
-
-            var callback = new TestRunCallback();
-            RunOnMainThread(() =>
-            {
-                var api = ScriptableObject.CreateInstance<TestRunnerApi>();
-                callback.Api = api;
-                api.RegisterCallbacks(callback);
-
-                var settings = new ExecutionSettings(new Filter
+                catch (Exception e)
                 {
-                    testMode = testMode,
-                    testNames = string.IsNullOrWhiteSpace(filter) ? null : new[] { filter }
-                });
-                api.Execute(settings);
+                    holder.Payload = Error($"Failed to list {modeLabel} tests: {e.Message}");
+                    holder.Done.Set();
+                }
             });
 
-            if (!callback.FinishedEvent.Wait(TestTimeoutMs))
-            {
-                RunOnMainThread(() =>
-                {
-                    if (callback.Api != null)
-                        callback.Api.UnregisterCallbacks(callback);
-                });
-                return Error($"Tests timed out after {TestTimeoutMs / 1000}s");
-            }
-
-            RunOnMainThread(() =>
-            {
-                if (callback.Api != null)
-                    callback.Api.UnregisterCallbacks(callback);
-            });
-
-            return callback.ResultJson ?? Error("Tests finished without a result");
-        }
-
-        static bool QueryIsCompiling()
-        {
-            bool compiling = true;
-            var done = new ManualResetEventSlim(false);
-
-            EditorApplication.delayCall += () =>
-            {
-                compiling = EditorApplication.isCompiling;
-                done.Set();
-            };
-
-            done.Wait(5000);
-            return compiling;
-        }
-
-        static void WaitUntil(Func<bool> condition, int timeoutMs)
-        {
             var sw = Stopwatch.StartNew();
-            while (sw.ElapsedMilliseconds < timeoutMs)
+            while (!holder.Done.IsSet)
             {
-                if (condition()) return;
-                Thread.Sleep(100);
+                if (!holder.Done.Wait(2000) && sw.ElapsedMilliseconds >= ListTestsTimeoutMs)
+                {
+                    error = Error($"Timed out listing {modeLabel} tests after {ListTestsTimeoutMs / 1000}s");
+                    return null;
+                }
             }
-            throw new TimeoutException($"Timed out after {timeoutMs / 1000}s");
+
+            if (holder.Payload != null && holder.Payload.Contains("\"status\":\"error\""))
+            {
+                error = holder.Payload;
+                return null;
+            }
+
+            return holder.Payload ?? "{\"count\":0,\"tests\":[]}";
         }
 
-        static string BuildCompileErrorsJson(List<CompilerMessage> errors)
+        static string BuildModeTestListJson(TestMode mode, ITestAdaptor root)
         {
+            var tests = new List<ITestAdaptor>();
+            if (root != null)
+                CollectListableTests(root, tests);
+
             var sb = new StringBuilder();
-            sb.Append("{\"errorCount\":").Append(errors.Count).Append(",\"errors\":[");
-            for (int i = 0; i < errors.Count; i++)
+            sb.Append("{\"mode\":").Append(JsonStr(ModeLabel(mode)));
+            sb.Append(",\"count\":").Append(tests.Count);
+            sb.Append(",\"tests\":[");
+            for (int i = 0; i < tests.Count; i++)
             {
                 if (i > 0) sb.Append(',');
-                var e = errors[i];
-                sb.Append("{\"file\":").Append(JsonStr(e.file)).Append(',');
-                sb.Append("\"line\":").Append(e.line).Append(',');
-                sb.Append("\"message\":").Append(JsonStr(e.message)).Append('}');
+                AppendTestEntry(sb, tests[i]);
             }
             sb.Append("]}");
             return sb.ToString();
+        }
+
+        static void CollectListableTests(ITestAdaptor node, List<ITestAdaptor> tests)
+        {
+            if (!node.IsSuite)
+            {
+                tests.Add(node);
+                return;
+            }
+
+            if (!node.HasChildren)
+                return;
+
+            foreach (var child in node.Children)
+                CollectListableTests(child, tests);
+        }
+
+        static void AppendTestEntry(StringBuilder sb, ITestAdaptor test)
+        {
+            sb.Append("{\"fullName\":").Append(JsonStr(test.FullName));
+            sb.Append(",\"name\":").Append(JsonStr(test.Name));
+
+            if (test.Categories != null && test.Categories.Length > 0)
+            {
+                sb.Append(",\"categories\":[");
+                for (int i = 0; i < test.Categories.Length; i++)
+                {
+                    if (i > 0) sb.Append(',');
+                    sb.Append(JsonStr(test.Categories[i]));
+                }
+                sb.Append(']');
+            }
+
+            sb.Append('}');
+        }
+
+        static string ModeLabel(TestMode mode)
+        {
+            return mode == TestMode.PlayMode ? "playmode" : "editmode";
+        }
+
+        static int CountTestsInModeJson(string modeJson)
+        {
+            const string key = "\"count\":";
+            int i = modeJson.IndexOf(key, StringComparison.Ordinal);
+            if (i < 0) return 0;
+            int start = i + key.Length;
+            int end = start;
+            while (end < modeJson.Length && "0123456789".IndexOf(modeJson[end]) >= 0) end++;
+            return int.TryParse(modeJson.Substring(start, end - start), out int count) ? count : 0;
         }
 
         static string Success(string message, string dataJson = null)
@@ -209,76 +266,16 @@ namespace UniSlop.MCP
             return $"{{\"status\":\"error\",\"message\":{JsonStr(message)},\"data\":{dataJson}}}";
         }
 
-        static string JsonStr(string value)
+        public static string JsonStr(string value)
         {
             if (value == null) return "null";
             return "\"" + value.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\n", "\\n").Replace("\r", "\\r") + "\"";
         }
 
-        class TestRunCallback : ICallbacks
+        class TestListHolder
         {
-            public TestRunnerApi Api;
-            public ManualResetEventSlim FinishedEvent = new ManualResetEventSlim(false);
-            public string ResultJson;
-
-            public void RunStarted(ITestAdaptor testsToRun) { }
-
-            public void RunFinished(ITestResultAdaptor result)
-            {
-                int passed = result.PassCount;
-                int failed = result.FailCount;
-                int skipped = result.SkipCount;
-                int total = passed + failed + skipped;
-                bool success = result.TestStatus == TestStatus.Passed;
-
-                var sb = new StringBuilder();
-                sb.Append("{\"passed\":").Append(passed);
-                sb.Append(",\"failed\":").Append(failed);
-                sb.Append(",\"skipped\":").Append(skipped);
-                sb.Append(",\"total\":").Append(total);
-                sb.Append(",\"durationMs\":").Append((long)(result.Duration * 1000));
-
-                var failures = new List<string>();
-                CollectFailures(result, failures);
-                if (failures.Count > 0)
-                {
-                    sb.Append(",\"failures\":[");
-                    sb.Append(string.Join(",", failures));
-                    sb.Append(']');
-                }
-
-                sb.Append('}');
-                string data = sb.ToString();
-
-                ResultJson = success
-                    ? Success($"Tests passed ({passed}/{total})", data)
-                    : Error($"Tests failed ({failed} failure(s), {passed}/{total} passed)", data);
-
-                FinishedEvent.Set();
-            }
-
-            public void TestStarted(ITestAdaptor test) { }
-            public void TestFinished(ITestResultAdaptor result) { }
-
-            static void CollectFailures(ITestResultAdaptor result, List<string> failures)
-            {
-                if (result.TestStatus == TestStatus.Failed)
-                {
-                    failures.Add("{\"name\":" + JsonStr(result.FullName)
-                        + ",\"message\":" + JsonStr(result.Message)
-                        + ",\"stackTrace\":" + JsonStr(Truncate(result.StackTrace, 2000)) + "}");
-                }
-
-                if (!result.HasChildren) return;
-                foreach (var child in result.Children)
-                    CollectFailures(child, failures);
-            }
-
-            static string Truncate(string value, int max)
-            {
-                if (string.IsNullOrEmpty(value) || value.Length <= max) return value;
-                return value.Substring(0, max) + "...";
-            }
+            public ManualResetEventSlim Done = new ManualResetEventSlim(false);
+            public string Payload;
         }
     }
 }
