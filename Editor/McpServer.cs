@@ -7,45 +7,43 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
-using System.Threading.Tasks;
 
 namespace UniSlop.MCP
 {
-    // Supervises the detached Bun MCP server and exposes an in-process JSON API for it.
+    // Supervises the detached MCP server and exposes an in-process JSON API for it.
     //
-    //   Zed ──(mcp-remote, :5107)──▶ Bun (detached process) ──(:5108 JSON)──▶ this listener
+    //   Agent ──(MCP, :5107)──▶ mono server (detached process) ──(JSON, dynamic port)──▶ this listener
     //
-    // The Bun process is intentionally NOT killed on domain reload — it owns the Zed connection
-    // and keeps polling while Unity reloads. Its PID is stored in SessionState so that after a
-    // reload we reattach to the running process instead of spawning a duplicate. Only the
-    // in-process :5108 listener is torn down and rebuilt around a reload.
+    // The MCP server is a small C# program (Editor/Server~/Server.cs) compiled by Unity's bundled
+    // mcs and run by Unity's bundled mono. It is intentionally NOT killed on domain reload — it owns
+    // the agent connection and keeps retrying while Unity reloads. Its PID is stored in SessionState
+    // so that after a reload we reattach to the running process instead of spawning a duplicate.
+    // The in-process JSON listener is torn down and rebuilt around a reload on a fresh ephemeral port
+    // published via UnityApiPortFilePath, which the server re-reads before each call.
     [InitializeOnLoad]
     public class McpServer
     {
-        const int McpServerPort = 5107;  // Bun MCP server (Zed connects here via mcp-remote)
-        const int UnityApiPort = 5108;   // Internal API: Bun -> Unity
+        public const int McpServerPort = 5107;  // MCP server (the agent connects here)
 
-        const string PidKey = "unislop.bun.pid";
-        const string ConnectedKey = "unislop.bun.connected";
+        const string PidKey = "unislop.server.pid";
+        const string ConnectedKey = "unislop.server.connected";
         const string SessionStartedKey = "unislop.session.started"; // SessionState: set once per editor session
-        const string LastPidPrefKey = "UniSlop.LastBunPid";          // EditorPrefs: survives editor restarts/crashes
+        const string LastPidPrefKey = "UniSlop.LastServerPid";       // EditorPrefs: survives editor restarts/crashes
 
-        static Process _bun;
+        static Process _server;
         static Socket _listenSocket;
         static volatile bool _listenerRunning;
-        static volatile bool _listenerStarting;
         static volatile bool _isShuttingDown;
+        static volatile bool _compileInFlight;
 
         public enum ServerStatus { Disabled, Starting, Running, Error }
         public static ServerStatus Status { get; private set; } = ServerStatus.Disabled;
-        public static bool HasBeenAccessed { get; private set; }
         public static bool IsListening { get; private set; }
         public static string LastError { get; private set; } = "";
         public static event Action StatusChanged;
 
         static McpServer()
         {
-            EditorApplication.update += UpdateLoop;
             AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;
             AssemblyReloadEvents.afterAssemblyReload += OnAfterAssemblyReload;
             EditorApplication.quitting += OnEditorQuitting;
@@ -76,7 +74,7 @@ namespace UniSlop.MCP
 
         static void OnBeforeAssemblyReload()
         {
-            // Tear down only the in-process listener; leave the Bun process running.
+            // Tear down only the in-process listener; leave the MCP server process running.
             _isShuttingDown = true;
             StopListener();
         }
@@ -85,47 +83,22 @@ namespace UniSlop.MCP
         {
             _isShuttingDown = true;
             StopListener();
-            KillBun();
-        }
-
-        static void UpdateLoop()
-        {
-            if (_isShuttingDown) return;
-            if (Status != ServerStatus.Running && Status != ServerStatus.Starting) return;
-
-            if (!_listenerRunning)
-            {
-                UnityEngine.Debug.LogWarning("[UniSlop] Internal API listener stopped; restarting...");
-                StartListener();
-            }
-
-            try
-            {
-                if (_bun != null && _bun.HasExited)
-                {
-                    LastError = "Bun MCP server process exited unexpectedly.";
-                    SessionState.EraseInt(PidKey);
-                    SetStatus(ServerStatus.Error);
-                }
-            }
-            catch (InvalidOperationException) { }
+            KillProcess();
         }
 
         public static void StartServer()
         {
             _isShuttingDown = false;
 
-            // Bind the internal port (no-op if already listening or a bind is already in flight).
-            // The bind runs on a background thread and retries transient conflicts, so it never
-            // needs the editor to tick and never stacks duplicate listeners.
-            StartListener();
+            // Bind the internal port (no-op if already listening).
+            if (!StartListener())
+                return;
 
             try
             {
-                EnsureBun();
+                EnsureProcess();
 
                 bool connected = SessionState.GetBool(ConnectedKey, false);
-                HasBeenAccessed = connected;
                 SetStatus(connected ? ServerStatus.Running : ServerStatus.Starting);
             }
             catch (Exception e)
@@ -140,16 +113,15 @@ namespace UniSlop.MCP
         public static void StopServer()
         {
             StopListener();
-            KillBun();
-            HasBeenAccessed = false;
+            KillProcess();
             IsListening = false;
             SessionState.SetBool(ConnectedKey, false);
             SetStatus(ServerStatus.Disabled);
         }
 
-        // --- Bun process lifecycle -------------------------------------------------------
+        // --- MCP server process lifecycle ------------------------------------------------------
 
-        static void EnsureBun()
+        static void EnsureProcess()
         {
             // SessionState survives domain reloads but is cleared when the editor closes, so an
             // unset flag means this is a fresh editor launch (not a reload).
@@ -158,52 +130,154 @@ namespace UniSlop.MCP
             if (firstLaunchThisSession)
             {
                 SessionState.SetBool(SessionStartedKey, true);
-                KillDanglingBun();
-                SpawnBun();
+                KillDangling();
+                StartProcess();
                 return;
             }
 
             // Domain reload: reattach to the process we spawned earlier this session.
             int pid = SessionState.GetInt(PidKey, -1);
-            if (pid > 0 && TryReattachBun(pid))
+            if (pid > 0 && TryReattach(pid))
                 return;
 
-            SpawnBun();
+            StartProcess();
         }
 
-        // Kill a Bun process left over from a previous editor session (e.g. after a crash).
-        static void KillDanglingBun()
+        // Launches the server, compiling first when the build is missing or stale. The launch and all
+        // SessionState bookkeeping stay on the main thread (both are instant), but compilation — cold
+        // mono start plus JIT, a couple of seconds — is pushed to a background thread so it never
+        // freezes the editor during startup or a domain reload.
+        static void StartProcess()
+        {
+            string exe = ServerExePath;
+
+            if (IsBuildFresh(exe))
+            {
+                Launch(exe);
+                return;
+            }
+
+            if (_compileInFlight)
+                return;
+
+            _compileInFlight = true;
+            string mono = MonoExecutablePath;
+            string mcs = CompilerPath;
+            string source = ServerSourcePath;
+
+            // Dedicated thread, NOT the shared ThreadPool: compilation must proceed even if the pool
+            // is busy, and it must never itself contend for pool threads.
+            new Thread(() =>
+            {
+                string output;
+                bool ok;
+                try { ok = CompileServerInternal(mono, mcs, source, exe, out output); }
+                catch (Exception e) { ok = false; output = e.Message; }
+                _compileInFlight = false;
+
+                // If the post is dropped (mid-reload), the next StartServer finds a fresh build and
+                // launches synchronously, so no state is lost.
+                McpMainThread.Post(() =>
+                {
+                    if (_isShuttingDown) return;
+                    if (!ok) { OnStartFailed("MCP server compilation failed:\n" + output); return; }
+                    Launch(exe);
+                });
+            }) { IsBackground = true, Name = "UniSlop Server Compile" }.Start();
+        }
+
+        static void Launch(string exe)
+        {
+            if (_server != null)
+            {
+                try { if (!_server.HasExited) return; } catch { }
+            }
+
+            string mono = MonoExecutablePath;
+            if (!File.Exists(mono))
+            {
+                OnStartFailed($"mono runtime not found at '{mono}'.");
+                return;
+            }
+
+            // Do NOT redirect stdout/stderr. The server is a detached process that outlives this
+            // AppDomain; redirected pipes whose draining tasks die on reload would fill the OS
+            // buffer and wedge the server. The server logs to its own file instead.
+            var psi = new ProcessStartInfo
+            {
+                FileName = mono,
+                Arguments = $"\"{exe}\" {McpServerPort} \"{UnityApiPortFilePath}\"",
+                WorkingDirectory = Path.GetDirectoryName(exe),
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = false,
+                RedirectStandardError = false
+            };
+
+            _server = Process.Start(psi);
+            if (_server == null)
+            {
+                OnStartFailed("Process.Start returned null for the mono runtime.");
+                return;
+            }
+            WatchProcessExit(_server);
+
+            SessionState.SetInt(PidKey, _server.Id);
+            SessionState.SetBool(ConnectedKey, false);
+            EditorPrefs.SetInt(LastPidPrefKey, _server.Id);
+
+            UnityEngine.Debug.Log($"[UniSlop] Started MCP server (mono pid {_server.Id}) at http://localhost:{McpServerPort}/mcp");
+        }
+
+        static void OnStartFailed(string message)
+        {
+            string msg = "[UniSlop] Failed to start MCP server: " + message;
+            UnityEngine.Debug.LogError(msg);
+            LastError = msg;
+            SetStatus(ServerStatus.Error);
+        }
+
+        static bool IsBuildFresh(string exe)
+        {
+            return File.Exists(exe)
+                && File.Exists(ServerSourcePath)
+                && File.GetLastWriteTimeUtc(exe) >= File.GetLastWriteTimeUtc(ServerSourcePath);
+        }
+
+        // Kill a server process left over from a previous editor session (e.g. after a crash).
+        static void KillDangling()
         {
             int pid = EditorPrefs.GetInt(LastPidPrefKey, -1);
             EditorPrefs.DeleteKey(LastPidPrefKey);
             if (pid > 0)
-                KillIfBun(pid);
+                KillIfMono(pid);
         }
 
-        static void KillIfBun(int pid)
+        static void KillIfMono(int pid)
         {
             if (pid <= 0 || pid == Process.GetCurrentProcess().Id) return;
             try
             {
                 var proc = Process.GetProcessById(pid);
-                if (!proc.HasExited && proc.ProcessName.StartsWith("bun", StringComparison.OrdinalIgnoreCase))
+                if (!proc.HasExited && proc.ProcessName.StartsWith("mono", StringComparison.OrdinalIgnoreCase))
                 {
                     proc.Kill();
-                    UnityEngine.Debug.Log($"[UniSlop] Killed dangling Bun MCP server (pid {pid}) from a previous session.");
+                    UnityEngine.Debug.Log($"[UniSlop] Killed dangling MCP server (mono pid {pid}) from a previous session.");
                 }
             }
             catch { }
         }
 
-        static bool TryReattachBun(int pid)
+        static bool TryReattach(int pid)
         {
             try
             {
                 var proc = Process.GetProcessById(pid);
-                if (proc.HasExited || !proc.ProcessName.StartsWith("bun", StringComparison.OrdinalIgnoreCase))
+                if (proc.HasExited || !proc.ProcessName.StartsWith("mono", StringComparison.OrdinalIgnoreCase))
                     return false;
 
-                _bun = proc;
+                _server = proc;
+                WatchProcessExit(_server);
                 return true;
             }
             catch
@@ -212,197 +286,280 @@ namespace UniSlop.MCP
             }
         }
 
-        static void SpawnBun()
+        static void WatchProcessExit(Process process)
         {
-            string packagePath = GetPackagePath();
-            string bunPath = GetBunPath(packagePath);
-            string serverScript = Path.Combine(packagePath, "Editor", "Server", "index.ts");
-
-            if (bunPath == null || !File.Exists(bunPath))
-                throw new FileNotFoundException($"Bun runtime not found at '{bunPath}'.");
-            if (!File.Exists(serverScript))
-                throw new FileNotFoundException($"Server script not found at '{serverScript}'.");
-
-            // Do NOT redirect stdout/stderr. Bun is a detached process that outlives this
-            // AppDomain; if its pipes were redirected, the draining tasks would die on domain
-            // reload, the OS pipe buffer would fill, and Bun would block on its next write
-            // (wedging the MCP server). Inherited handles are always drained by the OS.
-            var psi = new ProcessStartInfo
+            try
             {
-                FileName = bunPath,
-                Arguments = $"run \"{serverScript}\"",
-                WorkingDirectory = Path.GetDirectoryName(serverScript),
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                RedirectStandardOutput = false,
-                RedirectStandardError = false
-            };
-
-            _bun = Process.Start(psi);
-            if (_bun == null)
-                throw new InvalidOperationException("Process.Start returned null for the Bun runtime.");
-
-            SessionState.SetInt(PidKey, _bun.Id);
-            SessionState.SetBool(ConnectedKey, false);
-            EditorPrefs.SetInt(LastPidPrefKey, _bun.Id);
-
-            UnityEngine.Debug.Log($"[UniSlop] Started Bun MCP server (pid {_bun.Id}) at http://localhost:{McpServerPort}/mcp");
+                int watchedPid = process.Id;
+                process.EnableRaisingEvents = true;
+                process.Exited += (s, e) =>
+                {
+                    McpMainThread.Post(() =>
+                    {
+                        if (_isShuttingDown) return;
+                        if (SessionState.GetInt(PidKey, -1) != watchedPid) return;
+                        LastError = "MCP server process exited unexpectedly.";
+                        SessionState.EraseInt(PidKey);
+                        SetStatus(ServerStatus.Error);
+                    });
+                };
+            }
+            catch { }
         }
 
-        static void KillBun()
+        static void KillProcess()
         {
             int pid = SessionState.GetInt(PidKey, -1);
             SessionState.EraseInt(PidKey);
             EditorPrefs.DeleteKey(LastPidPrefKey);
 
-            if (_bun != null)
+            if (_server != null)
             {
-                try { if (!_bun.HasExited) _bun.Kill(); } catch { }
-                try { _bun.Dispose(); } catch { }
-                _bun = null;
+                try { if (!_server.HasExited) _server.Kill(); } catch { }
+                try { _server.Dispose(); } catch { }
+                _server = null;
             }
             else if (pid > 0)
             {
-                KillIfBun(pid);
+                KillIfMono(pid);
             }
         }
 
-        // --- Internal :5108 JSON API -----------------------------------------------------
+        // --- Paths and compilation (also used by the integration tests) ------------------------
 
-        // Binds the internal :5108 listener on a background thread, retrying until the port is free.
-        //
-        // We deliberately do NOT set SO_REUSEADDR. Unity's Mono does not reliably release a
-        // listening socket's port when Close() is called across a domain reload, so the old
-        // domain's socket can linger as a dead listener for a short while. With SO_REUSEADDR the
-        // new domain would bind a SECOND listener right next to the dead one; Windows then hands
-        // some connections to the dead socket (it accepts at the OS level but nothing ever replies),
-        // and the Bun poller hangs. Without SO_REUSEADDR only ONE listener can own the port at a
-        // time: the rebind simply fails with EADDRINUSE until the lingering socket is released,
-        // then succeeds — so a dead socket can never coexist and steal connections.
-        static void StartListener()
+        public static string MonoExecutablePath
         {
-            if (_listenerRunning || _listenerStarting)
-                return;
-
-            _listenerStarting = true;
-            Task.Run(BindLoop);
+            get
+            {
+                string bin = Path.Combine(EditorApplication.applicationContentsPath, "MonoBleedingEdge", "bin");
+                return Application.platform == RuntimePlatform.WindowsEditor
+                    ? Path.Combine(bin, "mono.exe")
+                    : Path.Combine(bin, "mono");
+            }
         }
 
-        static void BindLoop()
+        public static string CompilerPath
         {
-            DateTime deadline = DateTime.UtcNow.AddSeconds(30);
+            get { return Path.Combine(EditorApplication.applicationContentsPath, "MonoBleedingEdge", "lib", "mono", "4.5", "mcs.exe"); }
+        }
+
+        public static string ServerSourcePath
+        {
+            get { return Path.Combine(GetPackagePath(), "Editor", "Server~", "Server.cs"); }
+        }
+
+        public static string ServerExePath
+        {
+            get { return Path.GetFullPath(Path.Combine("Library", "UniSlop", "Server.exe")); }
+        }
+
+        public static string UnityApiPortFilePath
+        {
+            get { return Path.GetFullPath(Path.Combine("Library", "UniSlop", "unity-api-port.txt")); }
+        }
+
+        // Compiles ServerSourcePath to outputExe with the bundled compiler under mono. Returns true
+        // on success; otherwise output holds the combined compiler stdout/stderr. Safe to call from a
+        // background thread.
+        public static bool CompileServer(string outputExe, out string output)
+        {
+            return CompileServerInternal(MonoExecutablePath, CompilerPath, ServerSourcePath, outputExe, out output);
+        }
+
+        static bool CompileServerInternal(string mono, string mcs, string source, string outputExe, out string output)
+        {
+            if (!File.Exists(mono)) { output = $"mono runtime not found at '{mono}'."; return false; }
+            if (!File.Exists(mcs)) { output = $"C# compiler not found at '{mcs}'."; return false; }
+            if (!File.Exists(source)) { output = $"MCP server source not found at '{source}'."; return false; }
+
+            Directory.CreateDirectory(Path.GetDirectoryName(outputExe));
+
+            var psi = new ProcessStartInfo
+            {
+                FileName = mono,
+                Arguments = $"\"{mcs}\" -target:exe \"-out:{outputExe}\" -nologo \"{source}\"",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+
+            using (var process = Process.Start(psi))
+            {
+                // Drain both pipes concurrently on dedicated threads; reading them one after another
+                // can deadlock if the compiler fills the other buffer first. Dedicated threads (not
+                // the ThreadPool) keep this working even when the pool is saturated.
+                string outText = null, errText = null;
+                var tOut = new Thread(() => { try { outText = process.StandardOutput.ReadToEnd(); } catch { outText = ""; } }) { IsBackground = true };
+                var tErr = new Thread(() => { try { errText = process.StandardError.ReadToEnd(); } catch { errText = ""; } }) { IsBackground = true };
+                tOut.Start();
+                tErr.Start();
+
+                if (!process.WaitForExit(60000))
+                {
+                    try { process.Kill(); } catch { }
+                    output = "Compiler timed out after 60s.";
+                    return false;
+                }
+
+                tOut.Join(5000);
+                tErr.Join(5000);
+                output = ((outText ?? "") + (errText ?? "")).Trim();
+                return process.ExitCode == 0 && File.Exists(outputExe);
+            }
+        }
+
+        static string GetPackagePath()
+        {
+            return Path.GetFullPath("Packages/com.bananaparty.unislop");
+        }
+
+        public static string GetServerUrl() => $"http://localhost:{McpServerPort}/mcp";
+
+        // --- Internal JSON API (dynamic ephemeral port) ----------------------------------------
+
+        // Binds the internal Unity API on a fresh ephemeral localhost port each domain. The mono MCP
+        // process reads UnityApiPortFilePath before every call.
+        //
+        // Fixed :5108 is deliberately avoided. Unity/Mono can leak old-domain socket callbacks or
+        // threads across a reload; if a leaked listener squats on a fixed port, the new domain can
+        // never rebind and all tool calls hang. Binding port 0 makes leaked old ports irrelevant: the
+        // new domain always gets a clean port and publishes it atomically for the external process.
+        //
+        // Acceptance is ASYNCHRONOUS (BeginAccept), not a thread parked in accept. Closing the socket
+        // cancels pending accept and prevents a managed listener thread from surviving reload.
+        static bool StartListener()
+        {
+            if (_listenerRunning)
+                return true;
+
+            Socket socket = null;
             try
             {
-                while (!_isShuttingDown && DateTime.UtcNow < deadline)
+                socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                socket.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+                socket.Listen(16);
+
+                if (_isShuttingDown)
                 {
-                    Socket socket = null;
-                    try
-                    {
-                        socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-                        socket.Bind(new IPEndPoint(IPAddress.Loopback, UnityApiPort));
-                        socket.Listen(16);
-                        socket.Blocking = false;  // see AcceptLoop: never park inside a blocking syscall
-                    }
-                    catch (SocketException)
-                    {
-                        try { socket?.Close(); } catch { }
-                        Thread.Sleep(150);  // port still held by a not-yet-released old socket
-                        continue;
-                    }
-
-                    if (_isShuttingDown)
-                    {
-                        try { socket.Close(); } catch { }
-                        return;
-                    }
-
-                    _listenSocket = socket;
-                    _listenerRunning = true;
-                    IsListening = true;
-                    UnityEngine.Debug.Log($"[UniSlop] Internal API listening on 127.0.0.1:{UnityApiPort}");
-
-                    AcceptLoop(socket);  // blocks here (non-blocking accept loop) until torn down
-                    return;
+                    socket.Close();
+                    return false;
                 }
+
+                _listenSocket = socket;
+                _listenerRunning = true;
+                IsListening = true;
+                int port = ((IPEndPoint)socket.LocalEndPoint).Port;
+                WriteUnityApiPort(port);
+                UnityEngine.Debug.Log($"[UniSlop] Internal API listening on 127.0.0.1:{port}");
+
+                ArmAccept(socket);
+                return true;
             }
-            finally
+            catch (Exception e)
             {
-                _listenerStarting = false;
+                try { if (socket != null) socket.Close(); } catch { }
+                LastError = "Failed to bind Unity API listener: " + e.Message;
+                SetStatus(ServerStatus.Error);
+                return false;
             }
         }
 
-        static void AcceptLoop(Socket socket)
+        static void ArmAccept(Socket socket)
         {
-            // Non-blocking accept + sleep, never a blocking Accept(). A thread parked inside a
-            // blocking accept pins the socket in a syscall, and Mono then fails to release the port
-            // when StopListener closes it during a domain reload (see StartListener). Staying out of
-            // blocking syscalls lets Close() free the socket cleanly.
-            while (_listenerRunning)
+            if (!_listenerRunning)
+                return;
+            try
             {
-                Socket client;
-                try
-                {
-                    client = socket.Accept();
-                }
-                catch (SocketException ex) when (ex.SocketErrorCode == SocketError.WouldBlock)
-                {
-                    Thread.Sleep(50);
-                    continue;
-                }
-                catch
-                {
-                    break;  // socket closed (domain reload / StopListener)
-                }
-
-                _ = Task.Run(() => HandleClient(client));
+                socket.BeginAccept(OnAccept, socket);
             }
+            catch
+            {
+                // Socket closed (StopListener / reload) — nothing to re-arm.
+            }
+        }
+
+        static void OnAccept(IAsyncResult ar)
+        {
+            Socket socket = (Socket)ar.AsyncState;
+            Socket client = null;
+            try
+            {
+                client = socket.EndAccept(ar);
+            }
+            catch
+            {
+                return;  // socket closed (domain reload / StopListener); do not re-arm
+            }
+
+            // Re-arm for the next connection before handling this one.
+            ArmAccept(socket);
+
+            if (client == null)
+                return;
+
+            // One dedicated thread per connection (NOT the shared ThreadPool). Status polls must stay
+            // answerable even while another handler is parked waiting on the main thread, so handlers
+            // can never compete for a finite pool of threads.
+            new Thread(() => HandleClient(client)) { IsBackground = true, Name = "UniSlop API Handler" }.Start();
         }
 
         static void StopListener()
         {
             IsListening = false;
             _listenerRunning = false;
-            _listenerStarting = false;
+
+            // Closing the socket cancels any pending BeginAccept and releases the port. There is no
+            // parked accept thread to outlive the domain, so this alone prevents a zombie listener.
             Socket socket = _listenSocket;
             _listenSocket = null;
-            if (socket == null) return;
+            if (socket != null)
+            {
+                try { socket.Close(); } catch { }
+                try { socket.Dispose(); } catch { }
+            }
+        }
 
-            try { socket.Close(); } catch { }
-            try { socket.Dispose(); } catch { }
+        static void WriteUnityApiPort(int port)
+        {
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(UnityApiPortFilePath));
+                string temp = UnityApiPortFilePath + ".tmp";
+                File.WriteAllText(temp, port.ToString());
+                if (File.Exists(UnityApiPortFilePath))
+                    File.Delete(UnityApiPortFilePath);
+                File.Move(temp, UnityApiPortFilePath);
+            }
+            catch (Exception e)
+            {
+                UnityEngine.Debug.LogWarning("[UniSlop] Failed to publish Unity API port: " + e.Message);
+            }
         }
 
         static void HandleClient(Socket client)
         {
             try
             {
-                // The listening socket is non-blocking; the accepted socket can inherit that, which
-                // would make the blocking Receive/Send below fail immediately. Force blocking mode.
                 client.Blocking = true;
-                client.ReceiveTimeout = 30_000;  // idle keep-alive timeout
+                client.ReceiveTimeout = 30_000;
                 client.SendTimeout = 15_000;
 
-                // Keep-alive loop: the Bun poller hits this API every few hundred ms, so reusing one
-                // connection for many requests avoids churning a fresh TCP connection (and a lingering
-                // TIME_WAIT socket) per poll. We exit when the peer closes or the connection goes idle.
-                while (_listenerRunning)
+                string requestBody = ReadHttpRequestBody(client);
+                if (requestBody == null)
+                    return;
+
+                string responseJson;
+                try
                 {
-                    string requestBody = ReadHttpRequestBody(client);
-                    if (requestBody == null)
-                        break;  // peer closed, idle timeout, or malformed request
-
-                    string responseJson;
-                    try
-                    {
-                        responseJson = ProcessApiBody(requestBody);
-                    }
-                    catch (Exception e)
-                    {
-                        responseJson = McpUnityBridge.Error($"Internal API error: {e.Message}");
-                    }
-
-                    if (!WriteHttpResponse(client, responseJson))
-                        break;
+                    responseJson = ProcessApiBody(requestBody);
                 }
+                catch (Exception e)
+                {
+                    responseJson = McpUnityBridge.Error($"Internal API error: {e.Message}");
+                }
+
+                WriteHttpResponse(client, responseJson);
             }
             catch { }
             finally
@@ -450,25 +607,16 @@ namespace UniSlop.MCP
             return Encoding.UTF8.GetString(body.GetBuffer(), 0, (int)body.Length);
         }
 
-        // Writes an HTTP/1.1 keep-alive response. Returns false if the send failed (connection dead).
-        static bool WriteHttpResponse(Socket client, string json)
+        static void WriteHttpResponse(Socket client, string json)
         {
-            try
-            {
-                byte[] body = Encoding.UTF8.GetBytes(json);
-                string head = "HTTP/1.1 200 OK\r\n" +
-                              "Content-Type: application/json\r\n" +
-                              "Content-Length: " + body.Length + "\r\n" +
-                              "Connection: keep-alive\r\n\r\n";
-                client.Send(Encoding.ASCII.GetBytes(head));
-                if (body.Length > 0)
-                    client.Send(body);
-                return true;
-            }
-            catch
-            {
-                return false;
-            }
+            byte[] body = Encoding.UTF8.GetBytes(json);
+            string head = "HTTP/1.1 200 OK\r\n" +
+                          "Content-Type: application/json\r\n" +
+                          "Content-Length: " + body.Length + "\r\n" +
+                          "Connection: close\r\n\r\n";
+            client.Send(Encoding.ASCII.GetBytes(head));
+            if (body.Length > 0)
+                client.Send(body);
         }
 
         static int FindHeaderEnd(byte[] data, int length)
@@ -506,14 +654,16 @@ namespace UniSlop.MCP
                 return McpUnityBridge.Error("Missing command");
 
             if (command == "agent_connected")
+            {
                 MarkAgentConnected();
-            else
-                UnityEngine.Debug.Log($"[UniSlop] API command: {command}");
+                return "{\"status\":\"success\",\"message\":\"Agent connected\"}";
+            }
+
+            UnityEngine.Debug.Log($"[UniSlop] API command: {command}");
 
             var request = new McpRequest
             {
                 command = command,
-                wait = ExtractBool(body, "wait", true),
                 mode = ExtractString(body, "mode") ?? "all",
                 filter = ExtractString(body, "filter")
             };
@@ -526,55 +676,22 @@ namespace UniSlop.MCP
             McpMainThread.Post(() =>
             {
                 if (_isShuttingDown) return;
-                HasBeenAccessed = true;
                 SessionState.SetBool(ConnectedKey, true);
                 SetStatus(ServerStatus.Running);
             });
         }
 
-        static void SetStatus(ServerStatus status, bool notify = true)
+        static void SetStatus(ServerStatus status)
         {
             Status = status;
-            if (notify && !_isShuttingDown)
+            if (!_isShuttingDown)
             {
                 StatusChanged?.Invoke();
                 EditorApplication.QueuePlayerLoopUpdate();
             }
         }
 
-        // --- Paths -----------------------------------------------------------------------
-
-        static string GetPackagePath()
-        {
-            return Path.GetFullPath("Packages/com.bananaparty.unislop");
-        }
-
-        static string GetBunPath(string packagePath)
-        {
-            string osFolder = null;
-            string exeName = "bun";
-
-            if (Application.platform == RuntimePlatform.WindowsEditor)
-            {
-                osFolder = "bun-windows-x64";
-                exeName = "bun.exe";
-            }
-            else if (Application.platform == RuntimePlatform.OSXEditor)
-            {
-                osFolder = "bun-darwin-aarch64";
-            }
-            else if (Application.platform == RuntimePlatform.LinuxEditor)
-            {
-                osFolder = "bun-linux-x64";
-            }
-
-            if (osFolder == null) return null;
-            return Path.Combine(packagePath, "Editor", "Bun", osFolder, exeName);
-        }
-
-        public static string GetServerUrl() => $"http://localhost:{McpServerPort}/mcp";
-
-        // --- Minimal JSON field extraction (thread-safe, avoids JsonUtility off main thread) --
+        // --- Minimal JSON field extraction (thread-safe, avoids JsonUtility off main thread) ----
 
         static string ExtractString(string json, string key)
         {
@@ -609,20 +726,6 @@ namespace UniSlop.MCP
                 p++;
             }
             return sb.ToString();
-        }
-
-        static bool ExtractBool(string json, string key, bool defaultValue)
-        {
-            int i = json.IndexOf($"\"{key}\"", StringComparison.Ordinal);
-            if (i < 0) return defaultValue;
-            int colon = json.IndexOf(':', i + key.Length + 2);
-            if (colon < 0) return defaultValue;
-
-            int p = colon + 1;
-            while (p < json.Length && char.IsWhiteSpace(json[p])) p++;
-            if (json.IndexOf("true", p, StringComparison.Ordinal) == p) return true;
-            if (json.IndexOf("false", p, StringComparison.Ordinal) == p) return false;
-            return defaultValue;
         }
 
     }

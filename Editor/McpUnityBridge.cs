@@ -2,7 +2,6 @@ using UnityEditor;
 using UnityEditor.TestTools.TestRunner.Api;
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Text;
 using System.Threading;
 
@@ -12,14 +11,13 @@ namespace UniSlop.MCP
     public class McpRequest
     {
         public string command;
-        public bool wait = true;
         public string mode = "all";
         public string filter;
     }
 
-    // Internal API behind the detached Bun MCP server. Each command is short and non-blocking:
-    // compile and tests are kicked off as jobs (McpCompileJob / McpTestJob) and the Bun server
-    // polls *_status across domain reloads. Nothing here blocks waiting for a reload.
+    // Internal API behind the detached MCP server. Each command is short and non-blocking: compile
+    // and tests are kicked off as jobs (McpCompileJob / McpTestJob) and the MCP server polls
+    // *_status across domain reloads. Nothing here blocks waiting for a reload.
     public static class McpUnityBridge
     {
         const int DefaultTimeoutMs = 30_000;
@@ -28,9 +26,9 @@ namespace UniSlop.MCP
         public static string Handle(McpRequest request)
         {
             // Status polls are answered straight from a thread-safe cache, WITHOUT marshaling to
-            // the Unity main thread. While the editor is unfocused (user working in Zed) it may
-            // not tick, and a domain reload tears the main loop down — so a main-thread-bound poll
-            // would hang. The cache always has the latest state the editor wrote before reload.
+            // the Unity main thread. While the editor is unfocused (user working in their agent) it
+            // may not tick, and a domain reload tears the main loop down — so a main-thread-bound
+            // poll would hang. The cache always has the latest state the editor wrote before reload.
             switch (request.command)
             {
                 case "compile_status":
@@ -44,16 +42,14 @@ namespace UniSlop.MCP
             {
                 switch (request.command)
                 {
-                    case "agent_connected":
-                        return RunOnMainThread(() => Success("Agent connected"));
                     case "compile_start":
-                        return RunOnMainThread(() =>
+                        return McpMainThread.Invoke(() =>
                         {
                             McpCompileJob.Start();
                             return Success("Compilation started", "{\"state\":\"running\"}");
-                        });
+                        }, DefaultTimeoutMs);
                     case "run_tests_start":
-                        return RunOnMainThread(() => StartTestRun(request.mode, request.filter));
+                        return McpMainThread.Invoke(() => StartTestRun(request.mode, request.filter), DefaultTimeoutMs);
                     case "list_tests":
                         if (McpTestRunState.IsRunActive)
                             return Error("Cannot list tests while a Unity test run is in progress");
@@ -66,11 +62,6 @@ namespace UniSlop.MCP
             {
                 McpMainThread.EndRequest();
             }
-        }
-
-        static string RunOnMainThread(Func<string> action, int timeoutMs = DefaultTimeoutMs)
-        {
-            return McpMainThread.Invoke(action, timeoutMs);
         }
 
         static string CompileStatus()
@@ -164,14 +155,10 @@ namespace UniSlop.MCP
                 }
             });
 
-            var sw = Stopwatch.StartNew();
-            while (!holder.Done.IsSet)
+            if (!holder.Done.Wait(ListTestsTimeoutMs))
             {
-                if (!holder.Done.Wait(2000) && sw.ElapsedMilliseconds >= ListTestsTimeoutMs)
-                {
-                    error = Error($"Timed out listing {modeLabel} tests after {ListTestsTimeoutMs / 1000}s");
-                    return null;
-                }
+                error = Error($"Timed out listing {modeLabel} tests after {ListTestsTimeoutMs / 1000}s");
+                return null;
             }
 
             if (holder.Payload != null && holder.Payload.Contains("\"status\":\"error\""))

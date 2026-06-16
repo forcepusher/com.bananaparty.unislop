@@ -7,8 +7,8 @@ using UnityEditor;
 namespace UniSlop.MCP
 {
     // Unity throttles/stops EditorApplication.update when the editor window is not focused.
-    // To let MCP-driven work (compile/tests) progress while the user stays in Zed, this pump
-    // posts a non-blocking WM_NULL to the Unity window so its message loop keeps ticking.
+    // To let MCP-driven work (compile/tests) progress while the user stays in their agent/editor,
+    // this pump posts a non-blocking WM_NULL to the Unity window so its message loop keeps ticking.
     //
     // Hard rules to avoid deadlocking domain reload:
     //   - PostMessage only (async). Never SendMessage (it blocks until the window proc replies,
@@ -94,8 +94,17 @@ namespace UniSlop.MCP
         {
             while (_pumpRunning)
             {
-                if (!_suspended && McpMainThread.HasPendingWork && _unityHwnd != IntPtr.Zero)
-                    PostMessage(_unityHwnd, WmNull, IntPtr.Zero, IntPtr.Zero);
+                if (!_suspended && McpMainThread.HasPendingWork)
+                {
+                    // MainWindowHandle can briefly resolve to zero (e.g. right after a reload while
+                    // the window isn't foreground). Re-resolve here so a transient zero can never
+                    // permanently disable the pump and strand main-thread work forever.
+                    if (_unityHwnd == IntPtr.Zero)
+                        _unityHwnd = ResolveUnityHwnd();
+
+                    if (_unityHwnd != IntPtr.Zero)
+                        PostMessage(_unityHwnd, WmNull, IntPtr.Zero, IntPtr.Zero);
+                }
 
                 Thread.Sleep(16);
             }

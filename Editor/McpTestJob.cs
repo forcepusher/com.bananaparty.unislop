@@ -7,7 +7,7 @@ using UnityEditor.TestTools.TestRunner.Api;
 namespace UniSlop.MCP
 {
     // Runs Unity tests as a non-blocking job. run_tests_start kicks it off and returns
-    // immediately; the Bun server polls run_tests_status. Results are mirrored into SessionState
+    // immediately; the MCP server polls run_tests_status. Results are mirrored into SessionState
     // so they survive any domain reload triggered during the run. Reload is left unrestricted.
     [InitializeOnLoad]
     static class McpTestJob
@@ -15,9 +15,8 @@ namespace UniSlop.MCP
         const string StateKey = "unislop.tests.state";
         const string DataKey = "unislop.tests.data";
         const string MessageKey = "unislop.tests.message";
-        const string FailedKey = "unislop.tests.failed";
 
-        public const string StateIdle = "idle";
+        const string StateIdle = "idle";
         public const string StateRunning = "running";
         public const string StateDone = "done";
 
@@ -28,7 +27,6 @@ namespace UniSlop.MCP
         static string _state;
         static string _data;
         static string _message;
-        static int _failed;
 
         static McpTestJob()
         {
@@ -36,15 +34,13 @@ namespace UniSlop.MCP
             _state = SessionState.GetString(StateKey, StateIdle);
             _data = SessionState.GetString(DataKey, "");
             _message = SessionState.GetString(MessageKey, "");
-            _failed = SessionState.GetInt(FailedKey, 0);
 
             EditorApplication.update += Tick;
         }
 
-        // Thread-safe reads for the Bun poller (must not touch Unity API off the main thread).
+        // Thread-safe reads for the MCP poller (must not touch Unity API off the main thread).
         public static string State { get { lock (CacheLock) return _state; } }
         public static string Message { get { lock (CacheLock) return _message; } }
-        public static int Failed { get { lock (CacheLock) return _failed; } }
 
         // Call on the main thread.
         // mode: "all" (default) runs Edit Mode + Play Mode tests, "editmode" / "playmode" run one.
@@ -71,7 +67,7 @@ namespace UniSlop.MCP
             if (runEdit) filters.Add(BuildTestFilter(TestMode.EditMode, filter));
             if (runPlay) filters.Add(BuildTestFilter(TestMode.PlayMode, filter));
 
-            Persist(StateRunning, "", "", 0);
+            Persist(StateRunning, "", "");
 
             _pendingFilters = filters.ToArray();
             _pending = true;
@@ -119,29 +115,27 @@ namespace UniSlop.MCP
             }
             catch (Exception e)
             {
-                Finish("Failed to start tests: " + e.Message, null, 0);
+                Finish("Failed to start tests: " + e.Message, null);
             }
         }
 
-        static void Finish(string message, string dataJson, int failed)
+        static void Finish(string message, string dataJson)
         {
-            Persist(StateDone, dataJson ?? "", message, failed);
+            Persist(StateDone, dataJson ?? "", message);
         }
 
         // Writes both durable SessionState (survives reload) and the thread-safe cache (read by
         // the background poller). Always called on the main thread.
-        static void Persist(string state, string data, string message, int failed)
+        static void Persist(string state, string data, string message)
         {
             SessionState.SetString(StateKey, state);
             SessionState.SetString(DataKey, data);
             SessionState.SetString(MessageKey, message);
-            SessionState.SetInt(FailedKey, failed);
             lock (CacheLock)
             {
                 _state = state;
                 _data = data;
                 _message = message;
-                _failed = failed;
             }
         }
 
@@ -178,7 +172,7 @@ namespace UniSlop.MCP
                 {
                     if (result == null)
                     {
-                        Finish("Tests aborted without a result (likely a domain reload during the run)", null, 0);
+                        Finish("Tests aborted without a result (likely a domain reload during the run)", null);
                         return;
                     }
 
@@ -210,7 +204,7 @@ namespace UniSlop.MCP
                         ? $"Tests passed ({passed}/{total})"
                         : $"Tests failed ({failed} failure(s), {passed}/{total} passed)";
 
-                    Finish(message, sb.ToString(), failed);
+                    Finish(message, sb.ToString());
                 }
                 finally
                 {

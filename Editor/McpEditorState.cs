@@ -16,12 +16,7 @@ namespace UniSlop.MCP
 
         public static TestRunnerApi Api
         {
-            get
-            {
-                if (_api == null)
-                    _api = ScriptableObject.CreateInstance<TestRunnerApi>();
-                return _api;
-            }
+            get { return _api; }
         }
 
         static McpTestRunState()

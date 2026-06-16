@@ -8,10 +8,10 @@ namespace UniSlop.MCP
     // flips to "done") before the AppDomain unloads, so everything is mirrored into SessionState
     // — which survives reload — and read back once the editor comes back up.
     //
-    // The state is ALSO mirrored into a thread-safe in-memory cache. The Bun server polls
-    // compile_status from a background thread, and while the editor is unfocused (user in Zed) the
-    // main thread may never tick — so the poll must be answerable without marshaling to it. The
-    // cache is the source of truth for those reads; SessionState only seeds it after a reload.
+    // The state is ALSO mirrored into a thread-safe in-memory cache. The MCP server polls
+    // compile_status from a background thread, and while the editor is unfocused the main thread may
+    // never tick — so the poll must be answerable without marshaling to it. The cache is the source
+    // of truth for those reads; SessionState only seeds it after a reload.
     [InitializeOnLoad]
     static class McpCompileJob
     {
@@ -19,7 +19,7 @@ namespace UniSlop.MCP
         const string ErrorsKey = "unislop.compile.errors";
         const string CountKey = "unislop.compile.errorCount";
 
-        public const string StateIdle = "idle";
+        const string StateIdle = "idle";
         public const string StateRunning = "running";
         public const string StateDone = "done";
 
@@ -47,7 +47,7 @@ namespace UniSlop.MCP
             CompilationPipeline.RequestScriptCompilation();
         }
 
-        // Thread-safe reads for the Bun poller (must not touch Unity API off the main thread).
+        // Thread-safe reads for the MCP poller (must not touch Unity API off the main thread).
         public static string State { get { lock (CacheLock) return _state; } }
         public static int ErrorCount { get { lock (CacheLock) return _count; } }
 
@@ -80,9 +80,9 @@ namespace UniSlop.MCP
                 if (msg.type != CompilerMessageType.Error) continue;
 
                 if (sb.Length > 0) sb.Append(',');
-                sb.Append("{\"file\":").Append(JsonStr(msg.file));
+                sb.Append("{\"file\":").Append(McpUnityBridge.JsonStr(msg.file));
                 sb.Append(",\"line\":").Append(msg.line);
-                sb.Append(",\"message\":").Append(JsonStr(msg.message)).Append('}');
+                sb.Append(",\"message\":").Append(McpUnityBridge.JsonStr(msg.message)).Append('}');
                 count++;
             }
 
@@ -99,7 +99,7 @@ namespace UniSlop.MCP
         }
 
         // Writes both the durable SessionState (survives reload) and the thread-safe cache
-        // (read by the background poller). Always called on the main thread.
+        // (read by the background MCP poller). Always called on the main thread.
         static void Persist(string state, string errors, int count)
         {
             SessionState.SetString(StateKey, state);
@@ -113,14 +113,5 @@ namespace UniSlop.MCP
             }
         }
 
-        static string JsonStr(string value)
-        {
-            if (value == null) return "null";
-            return "\"" + value
-                .Replace("\\", "\\\\")
-                .Replace("\"", "\\\"")
-                .Replace("\n", "\\n")
-                .Replace("\r", "\\r") + "\"";
-        }
     }
 }

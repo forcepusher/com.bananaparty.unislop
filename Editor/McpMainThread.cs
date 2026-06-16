@@ -44,11 +44,21 @@ namespace UniSlop.MCP
 
         public static void BeginRequest()
         {
-            Interlocked.Increment(ref _inFlightRequests);
+            lock (QueueLock)
+                _inFlightRequests++;
             RequestEditorUpdate();
         }
 
-        public static void EndRequest() => Interlocked.Decrement(ref _inFlightRequests);
+        public static void EndRequest()
+        {
+            // OnBeforeAssemblyReload resets the counter to 0 underneath an in-flight request; guard so
+            // a late EndRequest can't drive it negative and wedge HasPendingWork.
+            lock (QueueLock)
+            {
+                if (_inFlightRequests > 0)
+                    _inFlightRequests--;
+            }
+        }
 
         public static void RequestEditorUpdate()
         {
@@ -124,8 +134,19 @@ namespace UniSlop.MCP
         {
             _isReloading = true;
             lock (QueueLock)
-                Queue.Clear();
-            _inFlightRequests = 0;
+            {
+                // Wake every pending waiter immediately instead of letting it block until its timeout.
+                // A request thread parked on item.Done across a reload would otherwise linger for the
+                // full timeout and, since these are manually created threads Unity does not reclaim,
+                // survive as a zombie. Signalling them lets the handler return and the thread exit now.
+                while (Queue.Count > 0)
+                {
+                    WorkItem item = Queue.Dequeue();
+                    item.Error = new Exception("Unity is reloading scripts");
+                    item.Done?.Set();
+                }
+                _inFlightRequests = 0;
+            }
         }
 
         static void OnAfterAssemblyReload() => _isReloading = false;
