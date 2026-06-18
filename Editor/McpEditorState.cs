@@ -21,6 +21,8 @@ namespace UniSlop.MCP
 
         static McpTestRunState()
         {
+            if (!McpEditorProcess.IsMainEditor) return;
+
             _api = ScriptableObject.CreateInstance<TestRunnerApi>();
             _api.RegisterCallbacks(new RunStateListener());
         }

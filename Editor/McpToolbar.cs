@@ -15,6 +15,8 @@ namespace UniSlop.MCP
 
         static McpToolbar()
         {
+            if (!McpEditorProcess.IsMainEditor) return;
+
             McpServer.StatusChanged += OnStatusChanged;
         }
 

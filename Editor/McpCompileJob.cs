@@ -30,6 +30,8 @@ namespace UniSlop.MCP
 
         static McpCompileJob()
         {
+            if (!McpEditorProcess.IsMainEditor) return;
+
             // Seed the cache from SessionState (main thread) so status is correct right after a reload.
             _state = SessionState.GetString(StateKey, StateIdle);
             _errors = SessionState.GetString(ErrorsKey, "");

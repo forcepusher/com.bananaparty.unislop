@@ -24,6 +24,8 @@ namespace UniSlop.MCP
 
         static McpMainThread()
         {
+            if (!McpEditorProcess.IsMainEditor) return;
+
             EditorApplication.update += Drain;
             AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;
             AssemblyReloadEvents.afterAssemblyReload += OnAfterAssemblyReload;

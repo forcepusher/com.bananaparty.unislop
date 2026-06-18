@@ -31,6 +31,8 @@ namespace UniSlop.MCP
 
         static McpEditorPump()
         {
+            if (!McpEditorProcess.IsMainEditor) return;
+
             _unityHwnd = ResolveUnityHwnd();
             AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;
             AssemblyReloadEvents.afterAssemblyReload += OnAfterAssemblyReload;

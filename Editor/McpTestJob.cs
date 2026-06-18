@@ -30,6 +30,8 @@ namespace UniSlop.MCP
 
         static McpTestJob()
         {
+            if (!McpEditorProcess.IsMainEditor) return;
+
             // Seed the thread-safe cache from SessionState so status is correct after a reload.
             _state = SessionState.GetString(StateKey, StateIdle);
             _data = SessionState.GetString(DataKey, "");

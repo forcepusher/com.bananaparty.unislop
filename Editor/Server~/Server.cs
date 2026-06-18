@@ -141,7 +141,9 @@ namespace UniSlop.Server
                     var responses = new List<object>();
                     foreach (object item in batch)
                     {
-                        object response = ProcessMessage(item as Dictionary<string, object>);
+                        var message = item as Dictionary<string, object>;
+                        NotifyMcpRequest(message);
+                        object response = ProcessMessage(message);
                         if (response != null) responses.Add(response);
                     }
                     if (responses.Count == 0)
@@ -151,7 +153,9 @@ namespace UniSlop.Server
                     return;
                 }
 
-                object single = ProcessMessage(parsed as Dictionary<string, object>);
+                var singleMessage = parsed as Dictionary<string, object>;
+                NotifyMcpRequest(singleMessage);
+                object single = ProcessMessage(singleMessage);
                 if (single == null)
                     Respond(context, 202, null, null);
                 else
@@ -556,6 +560,27 @@ namespace UniSlop.Server
             {
                 // Unity may not be ready yet; the toolbar updates on the next tool call.
             }
+        }
+
+        static void NotifyMcpRequest(Dictionary<string, object> message)
+        {
+            string method = Json.GetString(message, "method", null);
+            if (string.IsNullOrEmpty(method))
+                return;
+
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                try
+                {
+                    var parameters = new Dictionary<string, object>();
+                    parameters["method"] = method;
+                    CallUnity("mcp_request", parameters);
+                }
+                catch
+                {
+                    // Debug logging is best-effort; never delay or fail the MCP request.
+                }
+            });
         }
 
         static string FormatResult(UnityResponse result)
