@@ -51,6 +51,7 @@ namespace UniSlop.MCP
 
         // Thread-safe reads for the MCP poller (must not touch Unity API off the main thread).
         public static string State { get { lock (CacheLock) return _state; } }
+        public static bool IsActive => State == StateRunning;
         public static int ErrorCount { get { lock (CacheLock) return _count; } }
 
         // JSON object with state, errorCount and the accumulated error entries.

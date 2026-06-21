@@ -96,7 +96,7 @@ namespace UniSlop.MCP
         {
             while (_pumpRunning)
             {
-                if (!_suspended && McpMainThread.HasPendingWork)
+                if (!_suspended && NeedsEditorTick())
                 {
                     // MainWindowHandle can briefly resolve to zero (e.g. right after a reload while
                     // the window isn't foreground). Re-resolve here so a transient zero can never
@@ -110,6 +110,13 @@ namespace UniSlop.MCP
 
                 Thread.Sleep(16);
             }
+        }
+
+        static bool NeedsEditorTick()
+        {
+            return McpMainThread.HasPendingWork
+                || McpCompileJob.IsActive
+                || McpTestJob.IsActive;
         }
 
         static IntPtr ResolveUnityHwnd()
