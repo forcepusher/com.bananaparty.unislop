@@ -75,6 +75,7 @@ namespace UniSlop.MCP
             _pendingFilters = filters.ToArray();
             _pending = true;
 
+            McpEditorPump.NotifyWork();
             return true;
         }
 

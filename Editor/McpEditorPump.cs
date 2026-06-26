@@ -1,14 +1,17 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Threading;
 using UnityEditor;
+using UnityEngine;
 
 namespace UniSlop.MCP
 {
     // Unity throttles/stops EditorApplication.update when the editor window is not focused.
     // To let MCP-driven work (compile/tests) progress while the user stays in their agent/editor,
-    // this pump posts a non-blocking WM_NULL to the Unity window so its message loop keeps ticking.
+    // this pump posts a non-blocking WM_NULL to every visible Unity window so the message loop
+    // keeps ticking. While backgrounded it also chains QueuePlayerLoopUpdate on each editor tick.
     //
     // Hard rules to avoid deadlocking domain reload:
     //   - PostMessage only (async). Never SendMessage (it blocks until the window proc replies,
@@ -21,22 +24,40 @@ namespace UniSlop.MCP
         const uint WmNull = 0;
 
         static readonly object PumpLock = new object();
+        static readonly List<IntPtr> WindowBuffer = new List<IntPtr>();
+        static readonly EnumWindowsProc EnumWindowsCallback = CollectWindow;
         static Thread _pumpThread;
         static volatile bool _pumpRunning;
         static volatile bool _suspended;
-        static IntPtr _unityHwnd;
+
+        delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        static extern bool IsWindowVisible(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        static extern bool IsWindow(IntPtr hWnd);
 
         [DllImport("user32.dll")]
         static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lProcessId);
 
         static McpEditorPump()
         {
             if (!McpEditorProcess.IsMainEditor) return;
 
-            _unityHwnd = ResolveUnityHwnd();
             AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;
             AssemblyReloadEvents.afterAssemblyReload += OnAfterAssemblyReload;
             EditorApplication.quitting += StopPumpThread;
+            EditorApplication.update += SustainPlayerLoop;
             EnsurePumpThread();
         }
 
@@ -49,11 +70,34 @@ namespace UniSlop.MCP
         static void OnAfterAssemblyReload()
         {
             _suspended = false;
-            _unityHwnd = ResolveUnityHwnd();
             EnsurePumpThread();
+            if (NeedsEditorTick())
+                NotifyWork();
+        }
+
+        // Called on the main thread when MCP work needs the editor to keep ticking.
+        public static void NotifyWork()
+        {
+            Kick();
+            if (_suspended) return;
+            try { EditorApplication.QueuePlayerLoopUpdate(); } catch { }
         }
 
         public static void Kick() => EnsurePumpThread();
+
+        static void SustainPlayerLoop()
+        {
+            if (_suspended || !ShouldSustainPlayerLoop()) return;
+            try { EditorApplication.QueuePlayerLoopUpdate(); } catch { }
+        }
+
+        static bool ShouldSustainPlayerLoop()
+        {
+            if (!NeedsEditorTick()) return false;
+            if (Application.platform == RuntimePlatform.WindowsEditor)
+                return !IsUnityForeground();
+            return true;
+        }
 
         static void EnsurePumpThread()
         {
@@ -88,7 +132,6 @@ namespace UniSlop.MCP
                 _pumpThread = null;
             }
 
-            // Safe: PostMessage is non-blocking, so the loop exits within one Sleep tick.
             try { thread?.Join(500); } catch { }
         }
 
@@ -96,19 +139,11 @@ namespace UniSlop.MCP
         {
             while (_pumpRunning)
             {
-                if (!_suspended && NeedsEditorTick())
-                {
-                    // MainWindowHandle can briefly resolve to zero (e.g. right after a reload while
-                    // the window isn't foreground). Re-resolve here so a transient zero can never
-                    // permanently disable the pump and strand main-thread work forever.
-                    if (_unityHwnd == IntPtr.Zero)
-                        _unityHwnd = ResolveUnityHwnd();
+                bool needs = !_suspended && NeedsEditorTick();
+                if (needs && Application.platform == RuntimePlatform.WindowsEditor)
+                    PulseUnityWindows();
 
-                    if (_unityHwnd != IntPtr.Zero)
-                        PostMessage(_unityHwnd, WmNull, IntPtr.Zero, IntPtr.Zero);
-                }
-
-                Thread.Sleep(16);
+                Thread.Sleep(needs ? 8 : 50);
             }
         }
 
@@ -119,16 +154,57 @@ namespace UniSlop.MCP
                 || McpTestJob.IsActive;
         }
 
-        static IntPtr ResolveUnityHwnd()
+        static bool CollectWindow(IntPtr hWnd, IntPtr lParam)
+        {
+            GetWindowThreadProcessId(hWnd, out uint pid);
+            if (pid != (uint)Process.GetCurrentProcess().Id)
+                return true;
+            if (!IsWindowVisible(hWnd))
+                return true;
+
+            WindowBuffer.Add(hWnd);
+            return true;
+        }
+
+        static void PulseUnityWindows()
+        {
+            WindowBuffer.Clear();
+            EnumWindows(EnumWindowsCallback, IntPtr.Zero);
+
+            if (WindowBuffer.Count == 0)
+            {
+                IntPtr main = ResolveMainWindowHandle();
+                if (main != IntPtr.Zero)
+                    WindowBuffer.Add(main);
+            }
+
+            for (int i = 0; i < WindowBuffer.Count; i++)
+                PostMessage(WindowBuffer[i], WmNull, IntPtr.Zero, IntPtr.Zero);
+        }
+
+        static IntPtr ResolveMainWindowHandle()
         {
             try
             {
-                return Process.GetCurrentProcess().MainWindowHandle;
+                IntPtr main = Process.GetCurrentProcess().MainWindowHandle;
+                if (main != IntPtr.Zero && IsWindow(main))
+                    return main;
             }
-            catch
-            {
-                return IntPtr.Zero;
-            }
+            catch { }
+
+            WindowBuffer.Clear();
+            EnumWindows(EnumWindowsCallback, IntPtr.Zero);
+            return WindowBuffer.Count > 0 ? WindowBuffer[0] : IntPtr.Zero;
+        }
+
+        static bool IsUnityForeground()
+        {
+            IntPtr foreground = GetForegroundWindow();
+            if (foreground == IntPtr.Zero)
+                return false;
+
+            GetWindowThreadProcessId(foreground, out uint pid);
+            return pid == (uint)Process.GetCurrentProcess().Id;
         }
     }
 }

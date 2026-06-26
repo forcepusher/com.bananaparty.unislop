@@ -47,6 +47,7 @@ namespace UniSlop.MCP
         {
             Persist(StateRunning, "", 0);
             CompilationPipeline.RequestScriptCompilation();
+            McpEditorPump.NotifyWork();
         }
 
         // Thread-safe reads for the MCP poller (must not touch Unity API off the main thread).
