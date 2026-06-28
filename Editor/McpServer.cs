@@ -51,7 +51,7 @@ namespace UniSlop.MCP
             AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;
             AssemblyReloadEvents.afterAssemblyReload += OnAfterAssemblyReload;
             EditorApplication.quitting += OnEditorQuitting;
-            ScheduleStart();
+            EnsureServerStarted();
         }
 
         static void OnAfterAssemblyReload()
@@ -65,15 +65,38 @@ namespace UniSlop.MCP
             StartServer();
         }
 
-        static void ScheduleStart()
+        static void EnsureServerStarted()
         {
             // First launch only: afterAssemblyReload (which handles every reload) does not fire on
-            // the initial domain load, so defer the first StartServer to when the editor is ready.
-            EditorApplication.delayCall += () =>
+            // the initial domain load, so we need a different mechanism.
+            //
+            // Try starting immediately — at [InitializeOnLoad] time EditorApplication is available
+            // and StartListener / EnsureProcess use only .NET APIs (sockets, Process.Start). If it
+            // succeeds we never rely on delayCall, which does NOT fire while the editor is unfocused;
+            // that was the root cause of long delays on first compile because the MCP server had no
+            // listener to connect to and each attempt blocked for CallTimeoutMs (15 s).
+            if (_isShuttingDown)
+                return;
+
+            bool started = false;
+            try
             {
-                if (_isShuttingDown) return;
                 StartServer();
-            };
+                started = IsListening;
+            }
+            catch
+            {
+                // Unity API not ready yet — fall through to delayCall.
+            }
+
+            if (!started)
+            {
+                EditorApplication.delayCall += () =>
+                {
+                    if (_isShuttingDown) return;
+                    StartServer();
+                };
+            }
         }
 
         static void OnBeforeAssemblyReload()
@@ -186,7 +209,8 @@ namespace UniSlop.MCP
                     if (!ok) { OnStartFailed("MCP server compilation failed:\n" + output); return; }
                     Launch(exe);
                 });
-            }) { IsBackground = true, Name = "UniSlop Server Compile" }.Start();
+            })
+            { IsBackground = true, Name = "UniSlop Server Compile" }.Start();
         }
 
         static void Launch(string exe)
