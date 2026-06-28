@@ -1,4 +1,4 @@
-using UnityEditor;
+using System;
 
 namespace UniSlop.MCP
 {
@@ -7,6 +7,21 @@ namespace UniSlop.MCP
     // must stay in the main Editor process only.
     internal static class McpEditorProcess
     {
-        public static bool IsMainEditor => !AssetDatabase.IsAssetImportWorkerProcess();
+        // AssetDatabase.IsAssetImportWorkerProcess() is main-thread-only. Static ctors and the
+        // editor pump can run type initializers from background threads, so detect workers from the
+        // command line instead (safe on any thread, evaluated once at type load).
+        static readonly bool IsAssetImportWorker = DetectAssetImportWorker();
+
+        public static bool IsMainEditor => !IsAssetImportWorker;
+
+        static bool DetectAssetImportWorker()
+        {
+            string cmd = Environment.CommandLine;
+            if (cmd.IndexOf("AssetImportWorker", StringComparison.OrdinalIgnoreCase) >= 0)
+                return true;
+            if (cmd.IndexOf("-name AssetImport", StringComparison.OrdinalIgnoreCase) >= 0)
+                return true;
+            return false;
+        }
     }
 }

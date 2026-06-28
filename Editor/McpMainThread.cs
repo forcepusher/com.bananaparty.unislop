@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Runtime.InteropServices;
 using System.Threading;
 using UnityEditor;
 
@@ -14,6 +15,11 @@ namespace UniSlop.MCP
         static int _inFlightRequests;
         static volatile bool _isReloading;
 
+        [DllImport("kernel32.dll")]
+        static extern uint GetCurrentThreadId();
+
+        public static uint UnityOsThreadId { get; private set; }
+
         sealed class WorkItem
         {
             public Action Action;
@@ -26,6 +32,7 @@ namespace UniSlop.MCP
         {
             if (!McpEditorProcess.IsMainEditor) return;
 
+            UnityOsThreadId = GetCurrentThreadId();
             EditorApplication.update += Drain;
             AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;
             AssemblyReloadEvents.afterAssemblyReload += OnAfterAssemblyReload;

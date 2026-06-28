@@ -68,7 +68,11 @@ namespace UniSlop.MCP
             }
         }
 
-        static void OnCompilationStarted(object context) => Persist(StateRunning, "", 0);
+        static void OnCompilationStarted(object context)
+        {
+            Persist(StateRunning, "", 0);
+            McpEditorPump.NotifyWork();
+        }
 
         static void OnAssemblyCompilationFinished(string assemblyPath, CompilerMessage[] messages)
         {
