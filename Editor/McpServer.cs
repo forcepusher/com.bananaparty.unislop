@@ -29,7 +29,6 @@ namespace UniSlop.MCP
         const string PidKey = "unislop.server.pid";
         const string ConnectedKey = "unislop.server.connected";
         const string SessionStartedKey = "unislop.session.started"; // SessionState: set once per editor session
-        const string LastPidPrefKey = "UniSlop.LastServerPid";       // EditorPrefs: survives editor restarts/crashes
         const string ProcessMarker = "--unislop-mcp";
 
         static Process _server;
@@ -175,6 +174,8 @@ namespace UniSlop.MCP
         // freezes the editor during startup or a domain reload.
         static void StartProcess()
         {
+            KillAllMarkedServers();
+
             string exe = ServerExePath;
 
             if (IsBuildFresh(exe))
@@ -253,7 +254,6 @@ namespace UniSlop.MCP
 
             SessionState.SetInt(PidKey, _server.Id);
             SessionState.SetBool(ConnectedKey, false);
-            EditorPrefs.SetInt(LastPidPrefKey, _server.Id);
 
             UnityEngine.Debug.Log($"[UniSlop] Started MCP server (mono pid {_server.Id}) at http://localhost:{McpServerPort}/mcp");
         }
@@ -273,39 +273,28 @@ namespace UniSlop.MCP
                 && File.GetLastWriteTimeUtc(exe) >= File.GetLastWriteTimeUtc(ServerSourcePath);
         }
 
-        // Free :5107 before every launch. Orphans from crashes, other projects, or stop/start can
-        // otherwise win the bind race and the new server exits immediately.
+        // Kill every mono process launched with --unislop-mcp, then wait for :5107 to drop.
         static void EnsureMcpPortFree()
         {
-            var targets = new HashSet<int>();
-
-            int lastPid = EditorPrefs.GetInt(LastPidPrefKey, -1);
-            if (lastPid > 0)
-                targets.Add(lastPid);
-
-            int sessionPid = SessionState.GetInt(PidKey, -1);
-            if (sessionPid > 0)
-                targets.Add(sessionPid);
-
-            foreach (int pid in ListMarkedProcessIds())
-                targets.Add(pid);
-
-            foreach (int pid in ListListenerPidsOnPort(McpServerPort))
-            {
-                if (IsLikelyOurServerProcess(pid))
-                    targets.Add(pid);
-            }
-
-            foreach (int pid in targets)
-                KillIfOurServer(pid);
-
+            KillAllMarkedServers();
             WaitForPortFree(McpServerPort, 2000);
         }
 
-        static void KillIfOurServer(int pid)
+        static void KillAllMarkedServers()
+        {
+            foreach (int pid in ListMarkedProcessIds())
+                KillMarkedServer(pid);
+
+            if (_server != null)
+            {
+                try { if (_server.HasExited) _server = null; }
+                catch { _server = null; }
+            }
+        }
+
+        static void KillMarkedServer(int pid)
         {
             if (pid <= 0 || pid == Process.GetCurrentProcess().Id) return;
-            if (!IsLikelyOurServerProcess(pid)) return;
             try
             {
                 var proc = Process.GetProcessById(pid);
@@ -314,29 +303,14 @@ namespace UniSlop.MCP
                     return;
 
                 proc.Kill();
-                UnityEngine.Debug.Log($"[UniSlop] Killed dangling MCP server (mono pid {pid}).");
+                UnityEngine.Debug.Log($"[UniSlop] Killed MCP server (mono pid {pid}).");
+
+                if (_server != null && _server.Id == pid)
+                    _server = null;
+                if (SessionState.GetInt(PidKey, -1) == pid)
+                    SessionState.EraseInt(PidKey);
             }
             catch { }
-        }
-
-        static bool IsLikelyOurServerProcess(int pid)
-        {
-            if (pid <= 0 || pid == Process.GetCurrentProcess().Id) return false;
-
-            if (pid == EditorPrefs.GetInt(LastPidPrefKey, -1)) return true;
-            if (pid == SessionState.GetInt(PidKey, -1)) return true;
-
-            string cmd = GetProcessCommandLine(pid);
-            if (string.IsNullOrEmpty(cmd)) return false;
-
-            if (cmd.Contains(ProcessMarker)) return true;
-
-            string exeName = Path.GetFileName(ServerExePath);
-            if (cmd.IndexOf(exeName, StringComparison.OrdinalIgnoreCase) >= 0
-                && cmd.IndexOf(McpServerPort.ToString(), StringComparison.Ordinal) >= 0)
-                return true;
-
-            return false;
         }
 
         static void WaitForPortFree(int port, int timeoutMs)
@@ -421,24 +395,6 @@ namespace UniSlop.MCP
             catch { }
 
             return ids;
-        }
-
-        static string GetProcessCommandLine(int pid)
-        {
-            try
-            {
-                if (Application.platform == RuntimePlatform.WindowsEditor)
-                {
-                    return RunProcess("powershell",
-                        "-NoProfile -NonInteractive -Command \"(Get-CimInstance Win32_Process -Filter \\\"ProcessId=" + pid + "\\\").CommandLine\"");
-                }
-
-                return RunProcess("/bin/ps", "-p " + pid + " -o args=");
-            }
-            catch
-            {
-                return "";
-            }
         }
 
         static string RunProcess(string fileName, string arguments)
@@ -526,7 +482,6 @@ namespace UniSlop.MCP
 
         static void KillProcess()
         {
-            int pid = SessionState.GetInt(PidKey, -1);
             SessionState.EraseInt(PidKey);
 
             if (_server != null)
@@ -535,10 +490,8 @@ namespace UniSlop.MCP
                 try { _server.Dispose(); } catch { }
                 _server = null;
             }
-            else if (pid > 0)
-            {
-                KillIfOurServer(pid);
-            }
+
+            KillAllMarkedServers();
         }
 
         // --- Paths and compilation (also used by the integration tests) ------------------------
