@@ -37,6 +37,7 @@ namespace UniSlop.MCP
         static Thread _pumpThread;
         static volatile bool _pumpRunning;
         static volatile bool _suspended;
+        static volatile bool _playModeBlocked;
         static bool _boostActive;
         static bool _savedHadIdleKey;
         static bool _savedHadModeKey;
@@ -66,14 +67,6 @@ namespace UniSlop.MCP
 
             TouchDependentTypes();
 
-            // Pre-apply no-throttling settings so the editor ticks at full rate even while unfocused.
-            // Without this, SyncInteractionBoost (which runs on EditorApplication.update) creates a
-            // chicken-and-egg: Unity is throttled when unfocused → update fires too slowly or not at all
-            // → boost never applied → stays throttled. Clicking the editor fixes it because focus forces
-            // an update tick, which then applies the settings. Applying them here during initialization
-            // breaks that deadlock so background compilation works on first request.
-            EnterInteractionBoost();
-
             AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;
             AssemblyReloadEvents.afterAssemblyReload += OnAfterAssemblyReload;
             EditorApplication.quitting += OnEditorQuitting;
@@ -93,6 +86,7 @@ namespace UniSlop.MCP
 
         static void OnBeforeAssemblyReload()
         {
+            _playModeBlocked = true;
             ExitInteractionBoost();
             _suspended = true;
             StopPumpThread();
@@ -100,6 +94,7 @@ namespace UniSlop.MCP
 
         static void OnAfterAssemblyReload()
         {
+            _playModeBlocked = EditorApplication.isPlayingOrWillChangePlaymode;
             _suspended = false;
             TouchDependentTypes();
             EnsurePumpThread();
@@ -121,6 +116,11 @@ namespace UniSlop.MCP
 
         static void OnEditorUpdate()
         {
+            // The Unity Test Framework drives its own play-mode enter/exit stepping. Forcing No
+            // Throttling or extra player-loop ticks while it transitions trips its "Too many instant
+            // steps" guard and wedges the run (SaveModifiedSceneTask / ExitPlayModeTask). Back fully
+            // off whenever play mode is active or about to change.
+            _playModeBlocked = EditorApplication.isPlayingOrWillChangePlaymode;
             SyncInteractionBoost();
             SustainPlayerLoop();
         }
@@ -129,7 +129,7 @@ namespace UniSlop.MCP
         public static void NotifyWork()
         {
             Kick();
-            if (_suspended) return;
+            if (_suspended || EditorApplication.isPlayingOrWillChangePlaymode) return;
             SyncInteractionBoost();
             try { EditorApplication.QueuePlayerLoopUpdate(); } catch { }
         }
@@ -138,7 +138,7 @@ namespace UniSlop.MCP
 
         static void SyncInteractionBoost()
         {
-            if (_suspended)
+            if (_suspended || _playModeBlocked)
             {
                 ExitInteractionBoost();
                 return;
@@ -193,7 +193,7 @@ namespace UniSlop.MCP
 
         static void SustainPlayerLoop()
         {
-            if (_suspended || !ShouldSustainPlayerLoop()) return;
+            if (_suspended || _playModeBlocked || !ShouldSustainPlayerLoop()) return;
             try { EditorApplication.QueuePlayerLoopUpdate(); } catch { }
         }
 
@@ -243,7 +243,7 @@ namespace UniSlop.MCP
         {
             while (_pumpRunning)
             {
-                bool needs = !_suspended && NeedsEditorTick();
+                bool needs = !_suspended && !_playModeBlocked && NeedsEditorTick();
                 if (needs && Application.platform == RuntimePlatform.WindowsEditor)
                     PulseUnityWindows();
 
@@ -253,6 +253,12 @@ namespace UniSlop.MCP
 
         static bool NeedsEditorTick()
         {
+            // While TestRunnerApi is executing, it subscribes to EditorApplication.update itself.
+            // Extra WM_NULL / QueuePlayerLoopUpdate calls advance its task machine too fast and trip
+            // "Too many instant steps" during Play Mode enter/exit.
+            if (McpTestRunState.IsRunActive)
+                return false;
+
             return McpMainThread.HasPendingWork
                 || McpCompileJob.IsActive
                 || McpTestJob.IsActive;

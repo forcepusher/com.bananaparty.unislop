@@ -86,9 +86,8 @@ namespace UniSlop.MCP
 
         static string StartTestRun(string mode, string filter)
         {
-            if (McpTestJob.State == McpTestJob.StateRunning || McpTestRunState.IsRunActive)
-                return Success("A test run is already in progress", "{\"state\":\"running\"}");
-
+            // RequestStart is the single authority on whether a run can start: it distinguishes a
+            // genuinely active run from a stale "running" left by a dead run across a reload.
             if (!McpTestJob.RequestStart(mode, filter, out string error))
                 return Error(error);
 
