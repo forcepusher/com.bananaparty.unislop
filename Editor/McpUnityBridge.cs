@@ -25,42 +25,26 @@ namespace UniSlop.MCP
 
         public static string Handle(McpRequest request)
         {
-            // Status polls are answered straight from a thread-safe cache, WITHOUT marshaling to
-            // the Unity main thread. While the editor is unfocused (user working in their agent) it
-            // may not tick, and a domain reload tears the main loop down — so a main-thread-bound
-            // poll would hang. The cache always has the latest state the editor wrote before reload.
             switch (request.command)
             {
                 case "compile_status":
                     return CompileStatus();
                 case "run_tests_status":
                     return TestStatus();
-            }
-
-            McpMainThread.BeginRequest();
-            try
-            {
-                switch (request.command)
-                {
-                    case "compile_start":
-                        return McpMainThread.Invoke(() =>
-                        {
-                            McpCompileJob.Start();
-                            return Success("Compilation started", "{\"state\":\"running\"}");
-                        }, DefaultTimeoutMs);
-                    case "run_tests_start":
-                        return McpMainThread.Invoke(() => StartTestRun(request.mode, request.filter), DefaultTimeoutMs);
-                    case "list_tests":
-                        if (McpTestRunState.IsRunActive)
-                            return Error("Cannot list tests while a Unity test run is in progress");
-                        return ListTests();
-                    default:
-                        return Error($"Unknown command: {request.command}");
-                }
-            }
-            finally
-            {
-                McpMainThread.EndRequest();
+                case "compile_start":
+                    return McpMainThread.Invoke(() =>
+                    {
+                        McpCompileJob.Start();
+                        return Success("Compilation started", "{\"state\":\"running\"}");
+                    }, DefaultTimeoutMs);
+                case "run_tests_start":
+                    return McpMainThread.Invoke(() => StartTestRun(request.mode, request.filter), DefaultTimeoutMs);
+                case "list_tests":
+                    if (McpTestRunState.IsRunActive)
+                        return Error("Cannot list tests while a Unity test run is in progress");
+                    return ListTests();
+                default:
+                    return Error($"Unknown command: {request.command}");
             }
         }
 
@@ -86,8 +70,6 @@ namespace UniSlop.MCP
 
         static string StartTestRun(string mode, string filter)
         {
-            // RequestStart is the single authority on whether a run can start: it distinguishes a
-            // genuinely active run from a stale "running" left by a dead run across a reload.
             if (!McpTestJob.RequestStart(mode, filter, out string error))
                 return Error(error);
 

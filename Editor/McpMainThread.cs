@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Threading;
 using UnityEditor;
@@ -12,13 +13,7 @@ namespace UniSlop.MCP
         static readonly int MainThreadId = Thread.CurrentThread.ManagedThreadId;
         static readonly Queue<WorkItem> Queue = new Queue<WorkItem>();
         static readonly object QueueLock = new object();
-        static int _inFlightRequests;
         static volatile bool _isReloading;
-
-        [DllImport("kernel32.dll")]
-        static extern uint GetCurrentThreadId();
-
-        public static uint UnityOsThreadId { get; private set; }
 
         sealed class WorkItem
         {
@@ -32,7 +27,6 @@ namespace UniSlop.MCP
         {
             if (!McpEditorProcess.IsMainEditor) return;
 
-            UnityOsThreadId = GetCurrentThreadId();
             EditorApplication.update += Drain;
             AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;
             AssemblyReloadEvents.afterAssemblyReload += OnAfterAssemblyReload;
@@ -40,53 +34,12 @@ namespace UniSlop.MCP
 
         public static bool IsMainThread => Thread.CurrentThread.ManagedThreadId == MainThreadId;
 
-        public static bool HasPendingWork
-        {
-            get
-            {
-                if (_isReloading)
-                    return false;
-                lock (QueueLock)
-                    return _inFlightRequests > 0 || Queue.Count > 0;
-            }
-        }
-
-        public static void BeginRequest()
-        {
-            lock (QueueLock)
-                _inFlightRequests++;
-            RequestEditorUpdate();
-        }
-
-        public static void EndRequest()
-        {
-            // OnBeforeAssemblyReload resets the counter to 0 underneath an in-flight request; guard so
-            // a late EndRequest can't drive it negative and wedge HasPendingWork.
-            lock (QueueLock)
-            {
-                if (_inFlightRequests > 0)
-                    _inFlightRequests--;
-            }
-        }
-
-        public static void RequestEditorUpdate()
-        {
-            if (_isReloading)
-                return;
-
-            McpEditorPump.Kick();
-
-            if (IsMainThread)
-            {
-                try { EditorApplication.QueuePlayerLoopUpdate(); }
-                catch { }
-            }
-        }
-
         public static string Invoke(Func<string> action, int timeoutMs = 120_000)
         {
             if (_isReloading)
                 return McpUnityBridge.Error("Unity is reloading scripts");
+
+            BringEditorToForeground();
 
             if (IsMainThread)
             {
@@ -115,6 +68,8 @@ namespace UniSlop.MCP
             if (_isReloading)
                 return;
 
+            BringEditorToForeground();
+
             if (IsMainThread)
             {
                 try { action(); }
@@ -136,7 +91,17 @@ namespace UniSlop.MCP
         {
             lock (QueueLock)
                 Queue.Enqueue(item);
-            RequestEditorUpdate();
+        }
+
+        public static void BringEditorToForeground()
+        {
+#if UNITY_EDITOR_WIN
+            IntPtr hWnd = Process.GetCurrentProcess().MainWindowHandle;
+            if (hWnd == IntPtr.Zero) return;
+            AllowSetForegroundWindow(Process.GetCurrentProcess().Id);
+            ShowWindow(hWnd, IsIconic(hWnd) ? 9 : 5);
+            SetForegroundWindow(hWnd);
+#endif
         }
 
         static void OnBeforeAssemblyReload()
@@ -144,17 +109,12 @@ namespace UniSlop.MCP
             _isReloading = true;
             lock (QueueLock)
             {
-                // Wake every pending waiter immediately instead of letting it block until its timeout.
-                // A request thread parked on item.Done across a reload would otherwise linger for the
-                // full timeout and, since these are manually created threads Unity does not reclaim,
-                // survive as a zombie. Signalling them lets the handler return and the thread exit now.
                 while (Queue.Count > 0)
                 {
                     WorkItem item = Queue.Dequeue();
                     item.Error = new Exception("Unity is reloading scripts");
                     item.Done?.Set();
                 }
-                _inFlightRequests = 0;
             }
         }
 
@@ -179,9 +139,13 @@ namespace UniSlop.MCP
                 catch (Exception e) { item.Error = e; }
                 finally { item.Done?.Set(); }
             }
-
-            if (HasPendingWork)
-                EditorApplication.QueuePlayerLoopUpdate();
         }
+
+#if UNITY_EDITOR_WIN
+        [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr hWnd);
+        [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+        [DllImport("user32.dll")] static extern bool IsIconic(IntPtr hWnd);
+        [DllImport("user32.dll")] static extern bool AllowSetForegroundWindow(int dwProcessId);
+#endif
     }
 }

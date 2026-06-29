@@ -6,17 +6,7 @@ using UnityEditor.TestTools.TestRunner.Api;
 
 namespace UniSlop.MCP
 {
-    // Runs Unity tests as a non-blocking job. run_tests_start kicks it off and returns immediately;
-    // the MCP server polls run_tests_status.
-    //
-    // "all" runs Edit Mode and Play Mode SEQUENTIALLY, one TestRunnerApi.Execute per mode, and
-    // aggregates the results. Passing both modes to a single Execute fires RunFinished after Edit
-    // Mode alone, so the poller would see "done" with only the Edit Mode counts and miss every Play
-    // Mode test. Each mode's result is captured by the persistent listener in McpTestRunState
-    // (RecordResult) — a transient per-run callback would be lost across the Play Mode domain reload.
-    //
-    // The run plan (remaining modes), the running accumulator and the pending request all live in
-    // SessionState so a Play Mode reload mid-run resumes cleanly instead of stalling or under-counting.
+    // Non-blocking test job. "all" runs Edit Mode then Play Mode sequentially; state survives reload.
     [InitializeOnLoad]
     static class McpTestJob
     {
@@ -25,9 +15,6 @@ namespace UniSlop.MCP
         const string MessageKey = "unislop.tests.message";
         const string RemainingKey = "unislop.tests.remaining";
         const string FilterKey = "unislop.tests.filter";
-        const string StartTimeKey = "unislop.tests.startTime";
-        const string ExecutingKey = "unislop.tests.executing";
-
         const string AccPassedKey = "unislop.tests.acc.passed";
         const string AccFailedKey = "unislop.tests.acc.failed";
         const string AccSkippedKey = "unislop.tests.acc.skipped";
@@ -38,12 +25,6 @@ namespace UniSlop.MCP
         const string StateIdle = "idle";
         public const string StateRunning = "running";
         public const string StateDone = "done";
-
-        // A run with no progress after this long (editor seconds) is treated as dead so a new run
-        // can start. Comfortably longer than the MCP server's per-job budget.
-        const double StaleRunSeconds = 360.0;
-
-        static volatile bool _executing;
 
         static readonly object CacheLock = new object();
         static string _state;
@@ -57,26 +38,16 @@ namespace UniSlop.MCP
             _state = SessionState.GetString(StateKey, StateIdle);
             _data = SessionState.GetString(DataKey, "");
             _message = SessionState.GetString(MessageKey, "");
-            _executing = SessionState.GetBool(ExecutingKey, false);
 
-            // Recover from a domain reload that happened mid-run (Play Mode) or a dead run.
-            if (_state == StateRunning && !_executing && !McpTestRunState.IsRunActive)
-            {
-                if (RemainingModes().Count == 0)
-                    Finalize(); // all modes ran; just publish the aggregate (or reset if empty)
-                // else: a mode is still queued — Tick will start it.
-            }
+            if (_state == StateRunning && !McpTestRunState.IsRunActive && RemainingModes().Count == 0)
+                Finalize();
 
             EditorApplication.update += Tick;
         }
 
-        // Thread-safe reads for the MCP poller (must not touch Unity API off the main thread).
         public static string State { get { lock (CacheLock) return _state; } }
-        public static bool IsActive => State == StateRunning;
         public static string Message { get { lock (CacheLock) return _message; } }
 
-        // Call on the main thread.
-        // mode: "all" (default) runs Edit Mode + Play Mode tests, "editmode" / "playmode" run one.
         public static bool RequestStart(string mode, string filter, out string error)
         {
             error = null;
@@ -90,7 +61,7 @@ namespace UniSlop.MCP
                 return false;
             }
 
-            if (IsRunInProgress())
+            if (State == StateRunning || McpTestRunState.IsRunActive)
             {
                 error = "A test run is already in progress";
                 return false;
@@ -100,28 +71,11 @@ namespace UniSlop.MCP
             ResetAccumulator();
             SessionState.SetString(RemainingKey, ModesToString(modes));
             SessionState.SetString(FilterKey, filter ?? "");
-            SessionState.SetFloat(StartTimeKey, (float)EditorApplication.timeSinceStartup);
-            SessionState.SetBool(ExecutingKey, false);
-            _executing = false;
             Persist(StateRunning, "", "");
 
-            McpEditorPump.NotifyWork();
             return true;
         }
 
-        static bool IsRunInProgress()
-        {
-            if (_executing)
-                return true;
-            if (State != StateRunning)
-                return false;
-
-            float start = SessionState.GetFloat(StartTimeKey, 0f);
-            double elapsed = EditorApplication.timeSinceStartup - start;
-            return elapsed >= 0 && elapsed < StaleRunSeconds;
-        }
-
-        // Merges the persisted result data with the current state for run_tests_status.
         public static string BuildStatusData()
         {
             string state, data;
@@ -130,8 +84,6 @@ namespace UniSlop.MCP
             if (state != StateDone)
                 return "{\"state\":\"" + state + "\"}";
 
-            // Done with no payload means the run never produced a result (aborted). Report it as
-            // such instead of fabricating a zero-failure (which reads as "all passed").
             if (string.IsNullOrEmpty(data) || data[0] != '{')
                 return "{\"state\":\"done\",\"passed\":0,\"failed\":0,\"total\":0,\"aborted\":true}";
 
@@ -140,8 +92,6 @@ namespace UniSlop.MCP
 
         static void Tick()
         {
-            if (_executing)
-                return;
             if (State != StateRunning)
                 return;
             if (EditorApplication.isCompiling || EditorApplication.isUpdating || McpTestRunState.IsRunActive)
@@ -156,9 +106,8 @@ namespace UniSlop.MCP
 
         static void StartRun(TestMode mode)
         {
+            McpMainThread.BringEditorToForeground();
             string filter = SessionState.GetString(FilterKey, "");
-            SessionState.SetBool(ExecutingKey, true);
-            _executing = true;
             McpTestRunState.MarkExecuting();
             try
             {
@@ -167,45 +116,27 @@ namespace UniSlop.MCP
             }
             catch (Exception e)
             {
-                ClearExecuting();
+                McpTestRunState.ClearActive();
                 MarkAborted();
                 PopMode();
                 AdvanceOrFinish("Failed to start " + ModeLabel(mode) + " tests: " + e.Message);
             }
         }
 
-        // Called by McpTestRunState's persistent listener when a mode's run finishes (main thread).
-        public static void RecordResult(ITestResultAdaptor result)
+        public static void RecordResult(ITestResultAdaptor result, string error)
         {
-            Accumulate(result);
+            if (result == null)
+                MarkAborted();
+            else
+                Accumulate(result);
             PopMode();
-            ClearExecuting();
-            AdvanceOrFinish(null);
+            AdvanceOrFinish(error);
         }
 
-        // TestRunnerApi reports RunFailed (not RunFinished) when the internal task pipeline errors.
-        public static void RecordFailure(string message)
-        {
-            MarkAborted();
-            PopMode();
-            ClearExecuting();
-            AdvanceOrFinish(message);
-        }
-
-        static void ClearExecuting()
-        {
-            SessionState.SetBool(ExecutingKey, false);
-            _executing = false;
-        }
-
-        // Starts the next queued mode, or finalizes the aggregate when none remain.
         static void AdvanceOrFinish(string startError)
         {
             if (RemainingModes().Count > 0)
-            {
-                McpEditorPump.NotifyWork(); // Tick starts the next mode
                 return;
-            }
 
             Finalize(startError);
         }
@@ -250,12 +181,6 @@ namespace UniSlop.MCP
 
         static void Accumulate(ITestResultAdaptor result)
         {
-            if (result == null)
-            {
-                MarkAborted();
-                return;
-            }
-
             SessionState.SetInt(AccPassedKey, SessionState.GetInt(AccPassedKey, 0) + result.PassCount);
             SessionState.SetInt(AccFailedKey, SessionState.GetInt(AccFailedKey, 0) + result.FailCount);
             SessionState.SetInt(AccSkippedKey, SessionState.GetInt(AccSkippedKey, 0) + result.SkipCount);
@@ -289,8 +214,6 @@ namespace UniSlop.MCP
             SessionState.EraseString(FilterKey);
         }
 
-        // --- run plan (remaining modes) -------------------------------------------------------
-
         static List<TestMode> RemainingModes()
         {
             return ParseModeList(SessionState.GetString(RemainingKey, ""));
@@ -310,8 +233,6 @@ namespace UniSlop.MCP
             modes = new List<TestMode>();
 
             string m = string.IsNullOrEmpty(mode) ? "all" : mode.ToLowerInvariant();
-            // Edit Mode first: it cannot run once Play Mode has been entered, and it is the faster
-            // pass, so failures surface sooner.
             if (m == "all" || m == "editmode") modes.Add(TestMode.EditMode);
             if (m == "all" || m == "playmode") modes.Add(TestMode.PlayMode);
 
@@ -350,10 +271,6 @@ namespace UniSlop.MCP
 
         static string ModeLabel(TestMode mode) => mode == TestMode.EditMode ? "Edit Mode" : "Play Mode";
 
-        // --- persistence ----------------------------------------------------------------------
-
-        // Writes both durable SessionState (survives reload) and the thread-safe cache (read by
-        // the background poller). Always called on the main thread.
         static void Persist(string state, string data, string message)
         {
             SessionState.SetString(StateKey, state);
