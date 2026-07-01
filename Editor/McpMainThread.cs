@@ -10,6 +10,8 @@ namespace UniSlop.MCP
     [InitializeOnLoad]
     static class McpMainThread
     {
+        internal const string ReloadingMessage = "Unity is reloading scripts";
+
         static readonly int MainThreadId = Thread.CurrentThread.ManagedThreadId;
         static readonly Queue<WorkItem> Queue = new Queue<WorkItem>();
         static readonly object QueueLock = new object();
@@ -34,11 +36,63 @@ namespace UniSlop.MCP
 
         public static bool IsMainThread => Thread.CurrentThread.ManagedThreadId == MainThreadId;
 
-        public static string Invoke(Func<string> action, int timeoutMs = 120_000)
+        public static string Invoke(Func<string> action, int timeoutMs = 300_000)
         {
-            if (_isReloading)
-                return McpUnityBridge.Error("Unity is reloading scripts");
+            var sw = Stopwatch.StartNew();
 
+            while (sw.ElapsedMilliseconds < timeoutMs)
+            {
+                WaitForReload(sw, timeoutMs);
+                if (_isReloading)
+                    continue;
+
+                int remaining = timeoutMs - (int)sw.ElapsedMilliseconds;
+                if (remaining <= 0)
+                    break;
+
+                string result = InvokeOnce(action, remaining);
+                if (!IsReloadError(result))
+                    return result;
+            }
+
+            if (_isReloading)
+                return McpUnityBridge.Error(ReloadingMessage);
+
+            return McpUnityBridge.Error($"Unity main thread timed out after {timeoutMs / 1000}s");
+        }
+
+        public static void Post(Action action)
+        {
+            var sw = Stopwatch.StartNew();
+            const int timeoutMs = 300_000;
+
+            while (_isReloading && sw.ElapsedMilliseconds < timeoutMs)
+                Thread.Sleep(50);
+
+            if (_isReloading)
+                return;
+
+            BringEditorToForeground();
+
+            if (IsMainThread)
+            {
+                try { action(); }
+                catch (Exception e) { UnityEngine.Debug.LogException(e); }
+                return;
+            }
+
+            Enqueue(new WorkItem
+            {
+                Action = () =>
+                {
+                    try { action(); }
+                    catch (Exception e) { UnityEngine.Debug.LogException(e); }
+                }
+            });
+        }
+
+        static string InvokeOnce(Func<string> action, int timeoutMs)
+        {
             BringEditorToForeground();
 
             if (IsMainThread)
@@ -63,28 +117,15 @@ namespace UniSlop.MCP
             return item.Result;
         }
 
-        public static void Post(Action action)
+        static void WaitForReload(Stopwatch sw, int timeoutMs)
         {
-            if (_isReloading)
-                return;
+            while (_isReloading && sw.ElapsedMilliseconds < timeoutMs)
+                Thread.Sleep(50);
+        }
 
-            BringEditorToForeground();
-
-            if (IsMainThread)
-            {
-                try { action(); }
-                catch (Exception e) { UnityEngine.Debug.LogException(e); }
-                return;
-            }
-
-            Enqueue(new WorkItem
-            {
-                Action = () =>
-                {
-                    try { action(); }
-                    catch (Exception e) { UnityEngine.Debug.LogException(e); }
-                }
-            });
+        static bool IsReloadError(string result)
+        {
+            return result != null && result.IndexOf(ReloadingMessage, StringComparison.Ordinal) >= 0;
         }
 
         static void Enqueue(WorkItem item)
@@ -112,7 +153,7 @@ namespace UniSlop.MCP
                 while (Queue.Count > 0)
                 {
                     WorkItem item = Queue.Dequeue();
-                    item.Error = new Exception("Unity is reloading scripts");
+                    item.Error = new Exception(ReloadingMessage);
                     item.Done?.Set();
                 }
             }

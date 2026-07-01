@@ -361,7 +361,7 @@ namespace UniSlop.Server
         }
 
         // Like CallUnity, but tolerates the connection dropping while Unity reloads its AppDomain.
-        // Retries transport failures until the deadline; surfaces Unity error statuses immediately.
+        // Retries transport failures and transient "reloading scripts" responses until the deadline.
         static UnityResponse CallUnityResilient(string command, Dictionary<string, object> parameters, long deadline)
         {
             string lastError = "none";
@@ -371,8 +371,14 @@ namespace UniSlop.Server
                 {
                     return CallUnity(command, parameters);
                 }
-                catch (UnityErrorException)
+                catch (UnityErrorException e)
                 {
+                    if (IsReloadError(e.Message))
+                    {
+                        lastError = e.Message;
+                        Thread.Sleep(ReconnectIntervalMs);
+                        continue;
+                    }
                     throw;
                 }
                 catch (Exception e)
@@ -382,6 +388,12 @@ namespace UniSlop.Server
                 }
             }
             throw new Exception("Unity did not respond within " + (JobTimeoutMs / 1000) + "s (last error: " + lastError + ")");
+        }
+
+        static bool IsReloadError(string message)
+        {
+            return message != null
+                && message.IndexOf("reloading scripts", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
         // Single POST to the Unity in-process API. Throws UnityErrorException on a Unity-reported

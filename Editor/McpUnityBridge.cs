@@ -20,8 +20,8 @@ namespace UniSlop.MCP
     // *_status across domain reloads. Nothing here blocks waiting for a reload.
     public static class McpUnityBridge
     {
-        const int DefaultTimeoutMs = 30_000;
-        const int ListTestsTimeoutMs = 60_000;
+        const int DefaultTimeoutMs = 300_000;
+        const int ListTestsTimeoutMs = 300_000;
 
         public static string Handle(McpRequest request)
         {
