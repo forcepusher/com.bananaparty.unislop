@@ -68,7 +68,7 @@ namespace UniSlop.MCP.Tests
                 string initialize = PostMcp(TestMcpPort,
                     "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\"}}");
                 StringAssert.Contains("\"serverInfo\"", initialize);
-                StringAssert.Contains("UniSlop", initialize);
+                StringAssert.Contains("Unity MCP", initialize);
 
                 string tools = PostMcp(TestMcpPort, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}");
                 StringAssert.Contains("unity_compile", tools);
