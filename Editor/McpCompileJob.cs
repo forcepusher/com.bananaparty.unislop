@@ -15,10 +15,18 @@ namespace UniSlop.MCP
         public const string StateRunning = "running";
         public const string StateDone = "done";
 
+        // Grace period for Unity to actually begin compiling after RequestScriptCompilation.
+        // If nothing changed since the last successful compile, Unity silently skips the request
+        // (no compilationStarted/compilationFinished ever fire) and the job would stay "running"
+        // until the MCP server's 300s timeout. The watchdog finalizes it as done instead.
+        const double NoCompileGraceSeconds = 5.0;
+
         static readonly object CacheLock = new object();
         static string _state;
         static string _errors;
         static int _count;
+        static double _requestedAt = -1;
+        static bool _compilationStarted;
 
         static McpCompileJob()
         {
@@ -28,14 +36,43 @@ namespace UniSlop.MCP
             _errors = SessionState.GetString(ErrorsKey, "");
             _count = SessionState.GetInt(CountKey, 0);
 
+            CompilationPipeline.compilationStarted += OnCompilationStarted;
             CompilationPipeline.assemblyCompilationFinished += OnAssemblyCompilationFinished;
             CompilationPipeline.compilationFinished += OnCompilationFinished;
+            EditorApplication.update += Tick;
         }
 
         public static void Start()
         {
             Persist(StateRunning, "", 0);
+            _compilationStarted = false;
+            _requestedAt = EditorApplication.timeSinceStartup;
             CompilationPipeline.RequestScriptCompilation();
+        }
+
+        // Fires for every compilation, including editor-triggered ones Start() never saw. Without
+        // this reset, errors from a previous compile would be duplicated into the next report.
+        static void OnCompilationStarted(object context)
+        {
+            _compilationStarted = true;
+            Persist(StateRunning, "", 0);
+        }
+
+        // A domain reload wipes _requestedAt, which is correct: a reload means a compile actually
+        // ran, so the watchdog only ever fires in the skipped-compile case within the same domain.
+        static void Tick()
+        {
+            if (_requestedAt < 0 || _compilationStarted)
+                return;
+            if (State != StateRunning)
+                return;
+            if (EditorApplication.isCompiling || EditorApplication.isUpdating)
+                return;
+            if (EditorApplication.timeSinceStartup - _requestedAt < NoCompileGraceSeconds)
+                return;
+
+            _requestedAt = -1;
+            Persist(StateDone, "", 0);
         }
 
         public static string State { get { lock (CacheLock) return _state; } }

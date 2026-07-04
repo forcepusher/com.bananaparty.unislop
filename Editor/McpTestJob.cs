@@ -61,6 +61,13 @@ namespace UniSlop.MCP
                 return false;
             }
 
+            // With compile errors the Test Runner never starts a run, so the job would poll forever.
+            if (EditorUtility.scriptCompilationFailed)
+            {
+                error = "Cannot run tests: the project has compile errors (run unity_compile for details)";
+                return false;
+            }
+
             if (State == StateRunning || McpTestRunState.IsRunActive)
             {
                 error = "A test run is already in progress";
@@ -100,6 +107,13 @@ namespace UniSlop.MCP
             List<TestMode> remaining = RemainingModes();
             if (remaining.Count == 0)
                 return;
+
+            if (EditorUtility.scriptCompilationFailed)
+            {
+                MarkAborted();
+                Finalize("Test run aborted: the project has compile errors (run unity_compile for details)");
+                return;
+            }
 
             StartRun(remaining[0]);
         }

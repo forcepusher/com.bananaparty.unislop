@@ -160,6 +160,14 @@ namespace UniSlop.MCP
                 return;
             }
 
+            // A package update changed Server.cs mid-session: the running process is stale, so
+            // rebuild and relaunch instead of reattaching to the old binary.
+            if (!IsBuildFresh(ServerExePath))
+            {
+                StartProcess();
+                return;
+            }
+
             // Domain reload: reattach to the process we spawned earlier this session.
             int pid = SessionState.GetInt(PidKey, -1);
             if (pid > 0 && TryReattach(pid))
@@ -255,7 +263,7 @@ namespace UniSlop.MCP
             SessionState.SetInt(PidKey, _server.Id);
             SessionState.SetBool(ConnectedKey, false);
 
-            UnityEngine.Debug.Log($"[UniSlop] Started MCP server (mono pid {_server.Id}) at http://localhost:{McpServerPort}/mcp");
+            UnityEngine.Debug.Log($"[UniSlop] Started MCP server (mono pid {_server.Id}) at {GetServerUrl()}");
         }
 
         static void OnStartFailed(string message)
@@ -327,7 +335,8 @@ namespace UniSlop.MCP
         static List<int> ListListenerPidsOnPort(int port)
         {
             var pids = new List<int>();
-            string portToken = ":" + port;
+            // Trailing space keeps ":5107" from matching ":51070" in the local-address column.
+            string portToken = ":" + port + " ";
 
             try
             {
@@ -412,6 +421,10 @@ namespace UniSlop.MCP
             using (var process = Process.Start(psi))
             {
                 if (process == null) return "";
+                // Drain stderr concurrently; a child blocked writing a full stderr pipe would
+                // otherwise never close stdout and ReadToEnd would hang the caller forever.
+                var stderrDrain = new Thread(() => { try { process.StandardError.ReadToEnd(); } catch { } }) { IsBackground = true };
+                stderrDrain.Start();
                 string stdout = process.StandardOutput.ReadToEnd();
                 process.WaitForExit(5000);
                 return stdout;
@@ -583,7 +596,9 @@ namespace UniSlop.MCP
             return Path.GetFullPath("Packages/com.bananaparty.unislop");
         }
 
-        public static string GetServerUrl() => $"http://localhost:{McpServerPort}/mcp";
+        // 127.0.0.1, not localhost: the listener binds the IPv4 loopback only, and clients that
+        // resolve localhost to ::1 first would get a refused connection.
+        public static string GetServerUrl() => $"http://127.0.0.1:{McpServerPort}/mcp";
 
         // --- Internal JSON API (dynamic ephemeral port) ----------------------------------------
 
@@ -696,9 +711,12 @@ namespace UniSlop.MCP
                 Directory.CreateDirectory(Path.GetDirectoryName(UnityApiPortFilePath));
                 string temp = UnityApiPortFilePath + ".tmp";
                 File.WriteAllText(temp, port.ToString());
+                // File.Replace swaps atomically; Delete+Move leaves a window where the MCP server
+                // reads a missing file and burns a retry cycle.
                 if (File.Exists(UnityApiPortFilePath))
-                    File.Delete(UnityApiPortFilePath);
-                File.Move(temp, UnityApiPortFilePath);
+                    File.Replace(temp, UnityApiPortFilePath, null);
+                else
+                    File.Move(temp, UnityApiPortFilePath);
             }
             catch (Exception e)
             {

@@ -131,7 +131,17 @@ namespace UniSlop.MCP
         static void Enqueue(WorkItem item)
         {
             lock (QueueLock)
+            {
+                // An item enqueued after OnBeforeAssemblyReload flushed the queue would never be
+                // drained (the domain is dying); fail it immediately so the caller retries.
+                if (_isReloading)
+                {
+                    item.Error = new Exception(ReloadingMessage);
+                    item.Done?.Set();
+                    return;
+                }
                 Queue.Enqueue(item);
+            }
         }
 
         public static void BringEditorToForeground()

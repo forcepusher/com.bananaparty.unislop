@@ -68,6 +68,7 @@ namespace UniSlop.Server
             }
 
             var listener = new HttpListener();
+            listener.IgnoreWriteExceptions = true;
             listener.Prefixes.Add("http://127.0.0.1:" + mcpPort + "/");
             try
             {
@@ -90,8 +91,15 @@ namespace UniSlop.Server
                 }
                 catch (Exception e)
                 {
-                    Log("listener stopped: " + e.Message);
-                    break;
+                    // A single failed accept (malformed request, transient socket error) must not
+                    // kill the agent connection; only exit when the listener itself is gone.
+                    if (!listener.IsListening)
+                    {
+                        Log("listener stopped: " + e.Message);
+                        break;
+                    }
+                    Log("accept failed, continuing: " + e.Message);
+                    continue;
                 }
 
                 ThreadPool.QueueUserWorkItem(delegate { HandleHttp(context); });
@@ -291,7 +299,7 @@ namespace UniSlop.Server
             {
                 var p = new Dictionary<string, object>();
                 p["wait"] = false;
-                UnityResponse started = CallUnity("compile_start", p);
+                UnityResponse started = CallUnityResilient("compile_start", p, NowMs() + JobTimeoutMs);
                 return TextContent(FormatResult(started), false);
             }
 
@@ -328,7 +336,19 @@ namespace UniSlop.Server
         {
             long deadline = NowMs() + JobTimeoutMs;
 
-            UnityResponse started = CallUnityResilient(startCommand, parameters, deadline);
+            UnityResponse started;
+            try
+            {
+                started = CallUnityResilient(startCommand, parameters, deadline);
+            }
+            catch (UnityErrorException e)
+            {
+                // A retried start whose original response was lost (socket timeout mid-reload)
+                // reports the job as already running; attach to it and poll instead of failing.
+                if (!IsAlreadyRunningError(e.Message))
+                    throw;
+                started = new UnityResponse("success", e.Message, null);
+            }
 
             // The start call itself may already report a terminal result (e.g. nothing to compile).
             if (StateOf(started) == "done")
@@ -394,6 +414,12 @@ namespace UniSlop.Server
         {
             return message != null
                 && message.IndexOf("reloading scripts", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        static bool IsAlreadyRunningError(string message)
+        {
+            return message != null
+                && message.IndexOf("already in progress", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
         // Single POST to the Unity in-process API. Throws UnityErrorException on a Unity-reported
@@ -570,7 +596,9 @@ namespace UniSlop.Server
             }
             catch
             {
-                // Unity may not be ready yet; the toolbar updates on the next tool call.
+                // Unity was not ready; clear the flag so the next MCP request retries the
+                // notification instead of leaving the toolbar stuck on "Waiting" forever.
+                Interlocked.Exchange(ref _agentNotified, 0);
             }
         }
 
