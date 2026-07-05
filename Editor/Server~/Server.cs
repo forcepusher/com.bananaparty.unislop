@@ -40,7 +40,7 @@ namespace UniSlop.Server
         const int CallTimeoutMs = 15000;
 
         const string ProtocolVersion = "2025-06-18";
-        const string ServerName = "Unity MCP";
+        const string ServerName = "unity-mcp";
         const string ServerVersion = "2.1.0";
 
         const string UnityHost = "127.0.0.1";
