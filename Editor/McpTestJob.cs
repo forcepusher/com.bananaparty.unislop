@@ -308,9 +308,12 @@ namespace UniSlop.MCP
             if (trimmed.EndsWith(".Tests", StringComparison.OrdinalIgnoreCase)
                 || trimmed.EndsWith(".Tests.dll", StringComparison.OrdinalIgnoreCase))
             {
+                // Filter.assemblyNames expects the assembly name WITHOUT the .dll extension.
                 settings.assemblyNames = new[]
                 {
-                    trimmed.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) ? trimmed : trimmed + ".dll"
+                    trimmed.EndsWith(".dll", StringComparison.OrdinalIgnoreCase)
+                        ? trimmed.Substring(0, trimmed.Length - 4)
+                        : trimmed
                 };
                 return settings;
             }

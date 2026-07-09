@@ -182,8 +182,6 @@ namespace UniSlop.MCP
         // freezes the editor during startup or a domain reload.
         static void StartProcess()
         {
-            KillAllMarkedServers();
-
             string exe = ServerExePath;
 
             if (IsBuildFresh(exe))
@@ -326,51 +324,27 @@ namespace UniSlop.MCP
             var sw = Stopwatch.StartNew();
             while (sw.ElapsedMilliseconds < timeoutMs)
             {
-                if (ListListenerPidsOnPort(port).Count == 0)
+                if (!IsPortInUse(port))
                     return;
                 Thread.Sleep(50);
             }
         }
 
-        static List<int> ListListenerPidsOnPort(int port)
+        // A bind probe is cheap and cross-platform, unlike parsing netstat/lsof output.
+        static bool IsPortInUse(int port)
         {
-            var pids = new List<int>();
-            // Trailing space keeps ":5107" from matching ":51070" in the local-address column.
-            string portToken = ":" + port + " ";
-
             try
             {
-                if (Application.platform == RuntimePlatform.WindowsEditor)
+                using (var probe = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp))
                 {
-                    string output = RunProcess("netstat", "-ano -p tcp");
-                    foreach (string line in output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
-                    {
-                        if (line.IndexOf("LISTENING", StringComparison.OrdinalIgnoreCase) < 0) continue;
-                        if (line.IndexOf(portToken, StringComparison.Ordinal) < 0) continue;
-
-                        string trimmed = line.Trim();
-                        int lastSpace = trimmed.LastIndexOf(' ');
-                        if (lastSpace < 0 || !int.TryParse(trimmed.Substring(lastSpace + 1).Trim(), out int pid))
-                            continue;
-                        if (pid > 0)
-                            pids.Add(pid);
-                    }
-                    return pids;
-                }
-
-                string lsof = RunProcess("/usr/sbin/lsof", $"-nP -iTCP:{port} -sTCP:LISTEN -t");
-                if (string.IsNullOrWhiteSpace(lsof))
-                    lsof = RunProcess("lsof", $"-nP -iTCP:{port} -sTCP:LISTEN -t");
-
-                foreach (string line in lsof.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
-                {
-                    if (int.TryParse(line.Trim(), out int pid) && pid > 0)
-                        pids.Add(pid);
+                    probe.Bind(new IPEndPoint(IPAddress.Loopback, port));
+                    return false;
                 }
             }
-            catch { }
-
-            return pids;
+            catch (SocketException)
+            {
+                return true;
+            }
         }
 
         static List<int> ListMarkedProcessIds()
@@ -846,14 +820,10 @@ namespace UniSlop.MCP
                 return "{\"status\":\"success\",\"message\":\"Agent connected\"}";
             }
 
-            if (command == "mcp_request")
-            {
-                string method = ExtractString(body, "method") ?? "unknown";
-                UnityEngine.Debug.Log($"[UniSlop] MCP request: {method}");
-                return "{\"status\":\"success\",\"message\":\"MCP request logged\"}";
-            }
-
-            UnityEngine.Debug.Log($"[UniSlop] API command: {command}");
+            // Status polls arrive several times per second while a job runs; logging them would
+            // flood the console.
+            if (!command.EndsWith("_status", StringComparison.Ordinal))
+                UnityEngine.Debug.Log($"[UniSlop] API command: {command}");
 
             var request = new McpRequest
             {

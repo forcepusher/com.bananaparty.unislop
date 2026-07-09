@@ -3,10 +3,8 @@ using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
-using System.Text;
 using System.Threading;
 using NUnit.Framework;
-using UniSlop.MCP;
 
 namespace UniSlop.MCP.Tests
 {
@@ -45,7 +43,7 @@ namespace UniSlop.MCP.Tests
             var clock = Stopwatch.StartNew();
             while (clock.Elapsed.TotalSeconds < 15)
             {
-                if (TryConnect(McpPort)) return;
+                if (TestHttp.TryConnect(McpPort)) return;
                 Thread.Sleep(100);
             }
             Assert.Fail("MCP server never started listening on port " + McpPort);
@@ -67,6 +65,8 @@ namespace UniSlop.MCP.Tests
             _mock.TestsFailed = 0;
             _mock.TestsPassed = 3;
         }
+
+        // --- tools ---------------------------------------------------------------------------
 
         [Test]
         public void ListTestsTool_ReturnsTestCounts()
@@ -121,69 +121,76 @@ namespace UniSlop.MCP.Tests
             Assert.IsTrue(IsError(result), "expected isError:true:\n" + result);
         }
 
+        [Test]
+        public void UnknownTool_ReportsIsError()
+        {
+            string result = CallTool("unity_does_not_exist", "{}");
+            StringAssert.Contains("Unknown tool", result);
+            Assert.IsTrue(IsError(result), "expected isError:true:\n" + result);
+        }
+
+        // --- protocol ------------------------------------------------------------------------
+
+        [Test]
+        public void Ping_ReturnsEmptyResult()
+        {
+            string result = TestHttp.Post(McpPort, "/mcp", "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"ping\"}");
+            StringAssert.Contains("\"result\"", result);
+            StringAssert.Contains("\"id\":7", result);
+        }
+
+        [Test]
+        public void Initialize_EchoesRequestedProtocolVersion()
+        {
+            string result = TestHttp.Post(McpPort, "/mcp",
+                "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\"}}");
+            StringAssert.Contains("2024-11-05", result);
+            StringAssert.Contains("\"serverInfo\"", result);
+        }
+
+        [Test]
+        public void MalformedJson_ReturnsParseError()
+        {
+            string result = TestHttp.Post(McpPort, "/mcp", "{this is not json");
+            StringAssert.Contains("-32700", result);
+        }
+
+        [Test]
+        public void Notification_ReturnsAcceptedWithNoBody()
+        {
+            string raw = TestHttp.Request(McpPort, "POST", "/mcp",
+                "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}");
+            StringAssert.Contains("202", raw.Split('\r')[0]);
+        }
+
+        [Test]
+        public void BatchRequest_ReturnsResponseForEachRequest()
+        {
+            string result = TestHttp.Post(McpPort, "/mcp",
+                "[{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"ping\"},{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"ping\"}]");
+            StringAssert.Contains("\"id\":11", result);
+            StringAssert.Contains("\"id\":12", result);
+        }
+
+        [Test]
+        public void GetRequest_IsRejected()
+        {
+            string raw = TestHttp.Request(McpPort, "GET", "/mcp", null);
+            StringAssert.Contains("405", raw.Split('\r')[0]);
+        }
+
         // --- helpers -------------------------------------------------------------------------
 
         static string CallTool(string name, string argumentsJson)
         {
             string body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\""
                 + name + "\",\"arguments\":" + argumentsJson + "}}";
-            return PostMcp(McpPort, body);
+            return TestHttp.Post(McpPort, "/mcp", body);
         }
 
         static bool IsError(string responseBody)
         {
             return responseBody.Contains("\"isError\":true") || responseBody.Contains("\"isError\": true");
-        }
-
-        static bool TryConnect(int port)
-        {
-            try
-            {
-                using (var client = new TcpClient())
-                {
-                    client.Connect("127.0.0.1", port);
-                    return client.Connected;
-                }
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
-        static string PostMcp(int port, string json)
-        {
-            byte[] body = Encoding.UTF8.GetBytes(json);
-            using (var client = new TcpClient())
-            {
-                client.Connect("127.0.0.1", port);
-                client.ReceiveTimeout = 30000;
-                client.SendTimeout = 30000;
-                using (NetworkStream stream = client.GetStream())
-                {
-                    string head = "POST /mcp HTTP/1.1\r\n"
-                        + "Host: 127.0.0.1\r\n"
-                        + "Content-Type: application/json\r\n"
-                        + "Content-Length: " + body.Length + "\r\n"
-                        + "Connection: close\r\n\r\n";
-                    byte[] headBytes = Encoding.ASCII.GetBytes(head);
-                    stream.Write(headBytes, 0, headBytes.Length);
-                    stream.Write(body, 0, body.Length);
-                    stream.Flush();
-
-                    using (var received = new MemoryStream())
-                    {
-                        var buffer = new byte[4096];
-                        int read;
-                        while ((read = stream.Read(buffer, 0, buffer.Length)) > 0)
-                            received.Write(buffer, 0, read);
-
-                        string raw = Encoding.UTF8.GetString(received.GetBuffer(), 0, (int)received.Length);
-                        int bodyStart = raw.IndexOf("\r\n\r\n", StringComparison.Ordinal);
-                        return bodyStart >= 0 ? raw.Substring(bodyStart + 4) : raw;
-                    }
-                }
-            }
         }
 
         // A stand-in for the editor's internal JSON API. Answers the same command set the real
@@ -224,17 +231,8 @@ namespace UniSlop.MCP.Tests
                 using (client)
                 using (NetworkStream stream = client.GetStream())
                 {
-                    string requestBody = ReadRequest(stream);
-                    string response = Respond(requestBody ?? "");
-                    byte[] body = Encoding.UTF8.GetBytes(response);
-                    string head = "HTTP/1.1 200 OK\r\n"
-                        + "Content-Type: application/json\r\n"
-                        + "Content-Length: " + body.Length + "\r\n"
-                        + "Connection: close\r\n\r\n";
-                    byte[] headBytes = Encoding.ASCII.GetBytes(head);
-                    stream.Write(headBytes, 0, headBytes.Length);
-                    stream.Write(body, 0, body.Length);
-                    stream.Flush();
+                    string requestBody = TestHttp.ReadRequestBody(stream);
+                    TestHttp.WriteJsonResponse(stream, Respond(requestBody ?? ""));
                 }
             }
 
@@ -277,66 +275,6 @@ namespace UniSlop.MCP.Tests
                     return "{\"status\":\"success\",\"message\":\"Agent connected\"}";
 
                 return "{\"status\":\"error\",\"message\":\"Unknown command\"}";
-            }
-
-            static string ReadRequest(NetworkStream stream)
-            {
-                var received = new MemoryStream();
-                var buffer = new byte[4096];
-                int headerEnd = -1;
-
-                while (headerEnd < 0)
-                {
-                    int read = stream.Read(buffer, 0, buffer.Length);
-                    if (read <= 0) return null;
-                    received.Write(buffer, 0, read);
-                    headerEnd = FindHeaderEnd(received.GetBuffer(), (int)received.Length);
-                }
-
-                byte[] all = received.GetBuffer();
-                int total = (int)received.Length;
-                string headers = Encoding.ASCII.GetString(all, 0, headerEnd);
-                int contentLength = ParseContentLength(headers);
-
-                int bodyStart = headerEnd + 4;
-                var bodyStream = new MemoryStream();
-                if (total > bodyStart)
-                    bodyStream.Write(all, bodyStart, total - bodyStart);
-
-                while (contentLength >= 0 && bodyStream.Length < contentLength)
-                {
-                    int read = stream.Read(buffer, 0, buffer.Length);
-                    if (read <= 0) break;
-                    bodyStream.Write(buffer, 0, read);
-                }
-
-                return Encoding.UTF8.GetString(bodyStream.GetBuffer(), 0, (int)bodyStream.Length);
-            }
-
-            static int FindHeaderEnd(byte[] data, int length)
-            {
-                for (int i = 0; i + 3 < length; i++)
-                {
-                    if (data[i] == '\r' && data[i + 1] == '\n' && data[i + 2] == '\r' && data[i + 3] == '\n')
-                        return i;
-                }
-                return -1;
-            }
-
-            static int ParseContentLength(string headers)
-            {
-                foreach (string line in headers.Split('\n'))
-                {
-                    string trimmed = line.Trim();
-                    int colon = trimmed.IndexOf(':');
-                    if (colon < 0) continue;
-                    if (!trimmed.Substring(0, colon).Trim().Equals("Content-Length", StringComparison.OrdinalIgnoreCase))
-                        continue;
-                    int value;
-                    if (int.TryParse(trimmed.Substring(colon + 1).Trim(), out value))
-                        return value;
-                }
-                return -1;
             }
 
             public void Dispose()

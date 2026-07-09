@@ -41,7 +41,7 @@ namespace UniSlop.Server
 
         const string ProtocolVersion = "2025-06-18";
         const string ServerName = "unity-mcp";
-        const string ServerVersion = "2.1.0";
+        const string ServerVersion = "2.1.4";
 
         const string UnityHost = "127.0.0.1";
         static int _unityPort;
@@ -149,9 +149,7 @@ namespace UniSlop.Server
                     var responses = new List<object>();
                     foreach (object item in batch)
                     {
-                        var message = item as Dictionary<string, object>;
-                        NotifyMcpRequest(message);
-                        object response = ProcessMessage(message);
+                        object response = ProcessMessage(item as Dictionary<string, object>);
                         if (response != null) responses.Add(response);
                     }
                     if (responses.Count == 0)
@@ -161,9 +159,7 @@ namespace UniSlop.Server
                     return;
                 }
 
-                var singleMessage = parsed as Dictionary<string, object>;
-                NotifyMcpRequest(singleMessage);
-                object single = ProcessMessage(singleMessage);
+                object single = ProcessMessage(parsed as Dictionary<string, object>);
                 if (single == null)
                     Respond(context, 202, null, null);
                 else
@@ -297,15 +293,11 @@ namespace UniSlop.Server
 
             if (!wait)
             {
-                var p = new Dictionary<string, object>();
-                p["wait"] = false;
-                UnityResponse started = CallUnityResilient("compile_start", p, NowMs() + JobTimeoutMs);
+                UnityResponse started = CallUnityResilient("compile_start", null, NowMs() + JobTimeoutMs);
                 return TextContent(FormatResult(started), false);
             }
 
-            var jobParams = new Dictionary<string, object>();
-            jobParams["wait"] = true;
-            UnityResponse result = RunJob("compile_start", "compile_status", jobParams);
+            UnityResponse result = RunJob("compile_start", "compile_status", null);
             int errorCount = (int)Json.GetNumber(result.Data as Dictionary<string, object>, "errorCount", 0);
             return TextContent(FormatResult(result), errorCount > 0);
         }
@@ -600,27 +592,6 @@ namespace UniSlop.Server
                 // notification instead of leaving the toolbar stuck on "Waiting" forever.
                 Interlocked.Exchange(ref _agentNotified, 0);
             }
-        }
-
-        static void NotifyMcpRequest(Dictionary<string, object> message)
-        {
-            string method = Json.GetString(message, "method", null);
-            if (string.IsNullOrEmpty(method))
-                return;
-
-            ThreadPool.QueueUserWorkItem(delegate
-            {
-                try
-                {
-                    var parameters = new Dictionary<string, object>();
-                    parameters["method"] = method;
-                    CallUnity("mcp_request", parameters);
-                }
-                catch
-                {
-                    // Debug logging is best-effort; never delay or fail the MCP request.
-                }
-            });
         }
 
         static string FormatResult(UnityResponse result)

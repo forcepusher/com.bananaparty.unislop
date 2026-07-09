@@ -21,7 +21,6 @@ namespace UniSlop.MCP
     public static class McpUnityBridge
     {
         const int DefaultTimeoutMs = 300_000;
-        const int ListTestsTimeoutMs = 300_000;
 
         public static string Handle(McpRequest request)
         {
@@ -92,16 +91,14 @@ namespace UniSlop.MCP
 
         static string ListTests()
         {
-            string editModeJson = RetrieveTestModeJson(TestMode.EditMode, out string editError);
+            string editModeJson = RetrieveTestModeJson(TestMode.EditMode, out int editCount, out string editError);
             if (editError != null)
                 return editError;
 
-            string playModeJson = RetrieveTestModeJson(TestMode.PlayMode, out string playError);
+            string playModeJson = RetrieveTestModeJson(TestMode.PlayMode, out int playCount, out string playError);
             if (playError != null)
                 return playError;
 
-            int editCount = CountTestsInModeJson(editModeJson);
-            int playCount = CountTestsInModeJson(playModeJson);
             int total = editCount + playCount;
 
             string data = "{\"editmode\":" + editModeJson
@@ -113,8 +110,9 @@ namespace UniSlop.MCP
             return Success($"Listed {total} test(s) ({editCount} edit, {playCount} play)", data);
         }
 
-        static string RetrieveTestModeJson(TestMode mode, out string error)
+        static string RetrieveTestModeJson(TestMode mode, out int count, out string error)
         {
+            count = 0;
             error = null;
             var holder = new TestListHolder();
             string modeLabel = ModeLabel(mode);
@@ -125,7 +123,7 @@ namespace UniSlop.MCP
                 {
                     McpTestRunState.Api.RetrieveTestList(mode, root =>
                     {
-                        holder.Payload = BuildModeTestListJson(mode, root);
+                        holder.Payload = BuildModeTestListJson(mode, root, out holder.Count);
                         holder.Done.Set();
                     });
                 }
@@ -136,9 +134,9 @@ namespace UniSlop.MCP
                 }
             });
 
-            if (!holder.Done.Wait(ListTestsTimeoutMs))
+            if (!holder.Done.Wait(DefaultTimeoutMs))
             {
-                error = Error($"Timed out listing {modeLabel} tests after {ListTestsTimeoutMs / 1000}s");
+                error = Error($"Timed out listing {modeLabel} tests after {DefaultTimeoutMs / 1000}s");
                 return null;
             }
 
@@ -148,14 +146,16 @@ namespace UniSlop.MCP
                 return null;
             }
 
+            count = holder.Count;
             return holder.Payload ?? "{\"count\":0,\"tests\":[]}";
         }
 
-        static string BuildModeTestListJson(TestMode mode, ITestAdaptor root)
+        static string BuildModeTestListJson(TestMode mode, ITestAdaptor root, out int count)
         {
             var tests = new List<ITestAdaptor>();
             if (root != null)
                 CollectListableTests(root, tests);
+            count = tests.Count;
 
             var sb = new StringBuilder();
             sb.Append("{\"mode\":").Append(JsonStr(ModeLabel(mode)));
@@ -209,17 +209,6 @@ namespace UniSlop.MCP
             return mode == TestMode.PlayMode ? "playmode" : "editmode";
         }
 
-        static int CountTestsInModeJson(string modeJson)
-        {
-            const string key = "\"count\":";
-            int i = modeJson.IndexOf(key, StringComparison.Ordinal);
-            if (i < 0) return 0;
-            int start = i + key.Length;
-            int end = start;
-            while (end < modeJson.Length && "0123456789".IndexOf(modeJson[end]) >= 0) end++;
-            return int.TryParse(modeJson.Substring(start, end - start), out int count) ? count : 0;
-        }
-
         static string Success(string message, string dataJson = null)
         {
             if (dataJson == null)
@@ -244,6 +233,7 @@ namespace UniSlop.MCP
         {
             public ManualResetEventSlim Done = new ManualResetEventSlim(false);
             public string Payload;
+            public int Count;
         }
     }
 }
