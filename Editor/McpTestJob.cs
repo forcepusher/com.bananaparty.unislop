@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Text;
 using UnityEditor;
 using UnityEditor.TestTools.TestRunner.Api;
@@ -21,15 +22,28 @@ namespace UniSlop.MCP
         const string AccDurationKey = "unislop.tests.acc.durationMs";
         const string AccFailuresKey = "unislop.tests.acc.failures";
         const string AccAbortedKey = "unislop.tests.acc.aborted";
+        const string RunGuidKey = "unislop.tests.runGuid";
+        const string RunStartedAtKey = "unislop.tests.runStartedAt";
+        const string CancelRequestedKey = "unislop.tests.cancelRequested";
 
         const string StateIdle = "idle";
         public const string StateRunning = "running";
         public const string StateDone = "done";
 
+        // Watchdog: RunFinished/OnError are sometimes never delivered (Play Mode run stuck in
+        // initialization, callbacks lost across a domain reload). Without it the job polls forever.
+        const double StallGraceSeconds = 15;
+        const double RunTimeoutSeconds = 240;
+        const double CancelGraceSeconds = 30;
+
+        static readonly System.Reflection.MethodInfo IsRunActiveMethod = typeof(TestRunnerApi)
+            .GetMethod("IsRunActive", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+
         static readonly object CacheLock = new object();
         static string _state;
         static string _data;
         static string _message;
+        static double _stallDetectedAt;
 
         static McpTestJob()
         {
@@ -101,8 +115,15 @@ namespace UniSlop.MCP
         {
             if (State != StateRunning)
                 return;
-            if (EditorApplication.isCompiling || EditorApplication.isUpdating || McpTestRunState.IsRunActive)
+            if (EditorApplication.isCompiling || EditorApplication.isUpdating)
                 return;
+
+            if (McpTestRunState.IsRunActive)
+            {
+                WatchActiveRun();
+                return;
+            }
+            _stallDetectedAt = 0;
 
             List<TestMode> remaining = RemainingModes();
             if (remaining.Count == 0)
@@ -123,10 +144,13 @@ namespace UniSlop.MCP
             McpMainThread.BringEditorToForeground();
             string filter = SessionState.GetString(FilterKey, "");
             McpTestRunState.MarkExecuting();
+            SessionState.SetString(RunStartedAtKey, EditorApplication.timeSinceStartup.ToString("R", CultureInfo.InvariantCulture));
+            SessionState.SetBool(CancelRequestedKey, false);
+            _stallDetectedAt = 0;
             try
             {
                 var settings = new ExecutionSettings(BuildTestFilter(mode, filter));
-                McpTestRunState.Api.Execute(settings);
+                SessionState.SetString(RunGuidKey, McpTestRunState.Api.Execute(settings));
             }
             catch (Exception e)
             {
@@ -135,6 +159,60 @@ namespace UniSlop.MCP
                 PopMode();
                 AdvanceOrFinish("Failed to start " + ModeLabel(mode) + " tests: " + e.Message);
             }
+        }
+
+        static void WatchActiveRun()
+        {
+            double now = EditorApplication.timeSinceStartup;
+            string startedAtRaw = SessionState.GetString(RunStartedAtKey, "");
+            if (!double.TryParse(startedAtRaw, NumberStyles.Float, CultureInfo.InvariantCulture, out double startedAt)
+                || startedAt <= 0 || startedAt > now)
+            {
+                SessionState.SetString(RunStartedAtKey, now.ToString("R", CultureInfo.InvariantCulture));
+                return;
+            }
+
+            // The framework's runner registry is the source of truth; our SessionState flag can go
+            // stale when RunFinished/OnError is never delivered (e.g. lost across a domain reload).
+            bool frameworkRunning = IsRunActiveMethod == null || (bool)IsRunActiveMethod.Invoke(null, null);
+            if (!frameworkRunning)
+            {
+                if (_stallDetectedAt <= 0)
+                {
+                    _stallDetectedAt = now;
+                    return;
+                }
+                if (now - _stallDetectedAt < StallGraceSeconds)
+                    return;
+                RecoverStuckRun("Test run aborted: the Unity Test Runner stopped without reporting a result");
+                return;
+            }
+            _stallDetectedAt = 0;
+
+            double elapsed = now - startedAt;
+            if (elapsed < RunTimeoutSeconds)
+                return;
+
+            if (!SessionState.GetBool(CancelRequestedKey, false))
+            {
+                SessionState.SetBool(CancelRequestedKey, true);
+                TestRunnerApi.CancelTestRun(SessionState.GetString(RunGuidKey, ""));
+                return;
+            }
+
+            if (elapsed < RunTimeoutSeconds + CancelGraceSeconds)
+                return;
+            RecoverStuckRun($"Test run aborted: it exceeded {(int)RunTimeoutSeconds}s and did not respond to cancellation");
+        }
+
+        static void RecoverStuckRun(string reason)
+        {
+            _stallDetectedAt = 0;
+            McpTestRunState.ClearActive();
+            MarkAborted();
+            if (EditorApplication.isPlaying)
+                EditorApplication.ExitPlaymode();
+            Finalize(reason);
         }
 
         public static void RecordResult(ITestResultAdaptor result, string error)
@@ -226,6 +304,9 @@ namespace UniSlop.MCP
         {
             SessionState.EraseString(RemainingKey);
             SessionState.EraseString(FilterKey);
+            SessionState.EraseString(RunGuidKey);
+            SessionState.EraseString(RunStartedAtKey);
+            SessionState.EraseBool(CancelRequestedKey);
         }
 
         static List<TestMode> RemainingModes()

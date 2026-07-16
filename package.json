@@ -1,6 +1,6 @@
 {
     "name": "com.bananaparty.unislop",
-    "version": "2.1.4",
+    "version": "2.1.5",
     "displayName": "UniSlop",
     "unity": "6000.3",
     "description": "Minimalistic portative MCP server for unity, designed for coding.",
