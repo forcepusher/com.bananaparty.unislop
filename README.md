@@ -17,14 +17,14 @@ To update the package, simply add it again using a different version tag.
 The server is started automatically at `http://127.0.0.1:5107/mcp`
 Ships with a convenient status bar that displays server status and MCP connection status.  
 At the top right corner of your Unity UI, click three dots -> UniSlop -> Tick on "MCP".  
-
-Cursor MCP config (requires [Bun](https://bun.com/docs/installation#windows) installed):
+  
+Cursor MCP config (requires [Node.js](https://nodejs.org/en/download) installed):  
 ```
 {
   "mcpServers": {
     "unity-mcp": {
-      "command": "bun",
-      "args": ["x","mcp-remote","http://127.0.0.1:5107/mcp","--transport","http-only","--allow-http"],
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "http://127.0.0.1:5107/mcp", "--transport", "http-only", "--allow-http"],
       "env": {}
     }
   }
